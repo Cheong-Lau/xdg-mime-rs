@@ -10,33 +10,25 @@ use nom::IResult;
 use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::{self, FromStr};
 use std::vec::Vec;
 
 use mime::Mime;
 
-pub fn to_string(s: &[u8]) -> std::result::Result<&str, std::str::Utf8Error> {
-    str::from_utf8(s)
-}
-
-pub fn to_u32(s: std::result::Result<&str, std::str::Utf8Error>, or_default: u32) -> u32 {
-    match s {
-        Ok(t) => str::FromStr::from_str(t).unwrap_or(or_default),
-        Err(_) => or_default,
-    }
-}
-
 pub fn buf_to_u32(s: &[u8], or_default: u32) -> u32 {
-    to_u32(to_string(s), or_default)
+    str::from_utf8(s)
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(or_default)
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct MagicRule {
     indent: u32,
     start_offset: u32,
-    value: Vec<u8>,
-    mask: Option<Vec<u8>>,
+    value: Box<[u8]>,
+    mask: Option<Box<[u8]>>,
     word_size: u32,
     range_length: u32,
 }
@@ -52,20 +44,20 @@ fn masked_slices_are_equal(a: &[u8], b: &[u8], mask: &[u8]) -> bool {
 
 impl MagicRule {
     fn matches_data(&self, data: &[u8]) -> bool {
-        assert!(self.mask.is_none() || self.mask.as_ref().unwrap().len() == self.value.len());
+        let mask = self.mask.as_deref();
+        let value = self.value.as_ref();
+        let value_len = value.len();
+        assert!(mask.map_or(true, |mask| mask.len() == value_len));
 
         let start = self.start_offset as usize;
         let range_length = self.range_length as usize;
-        let value_len = self.value.len();
 
         let mut data_windows = data.windows(value_len).skip(start).take(range_length);
 
-        match &self.mask {
-            Some(mask) => {
-                data_windows.any(|data_w| masked_slices_are_equal(data_w, &self.value, mask))
-            }
+        match mask {
+            Some(mask) => data_windows.any(|data_w| masked_slices_are_equal(data_w, value, mask)),
 
-            None => data_windows.any(|data_w| data_w == &self.value[..]),
+            None => data_windows.any(|data_w| *data_w == *value),
         }
     }
 
@@ -124,17 +116,17 @@ fn range_length(bytes: &[u8]) -> IResult<&[u8], Option<u32>> {
 // [ '&' <mask> ] [ <word_size> ] [ <range_length> ]
 // '\n'
 
-fn value(bytes: &[u8], length: u16) -> IResult<&[u8], Vec<u8>> {
+fn value(bytes: &[u8], length: u16) -> IResult<&[u8], Box<[u8]>> {
     let (bytes, res) = take(length)(bytes)?;
 
-    Ok((bytes, res.to_vec()))
+    Ok((bytes, res.into()))
 }
 
-fn mask(bytes: &[u8], length: u16) -> IResult<&[u8], Option<Vec<u8>>> {
+fn mask(bytes: &[u8], length: u16) -> IResult<&[u8], Option<Box<[u8]>>> {
     let (bytes, res) = opt(tuple((char('&'), take(length))))(bytes)?;
 
     let value = match res {
-        Some(v) => v.1.to_vec(),
+        Some(v) => v.1.into(),
         None => return Ok((bytes, None)),
     };
 
@@ -176,7 +168,7 @@ fn magic_rule(bytes: &[u8]) -> IResult<&[u8], MagicRule> {
 pub struct MagicEntry {
     mime_type: Mime,
     priority: u32,
-    rules: Vec<MagicRule>,
+    rules: Box<[MagicRule]>,
 }
 
 impl fmt::Debug for MagicEntry {
@@ -216,7 +208,7 @@ impl MagicEntry {
                         // last rule
                         return Some((&self.mime_type, self.priority));
                     }
-                };
+                }
             }
         }
 
@@ -258,7 +250,7 @@ fn magic_entry(bytes: &[u8]) -> IResult<&[u8], MagicEntry> {
         MagicEntry {
             priority: _header.0,
             mime_type: _header.1,
-            rules: _rules,
+            rules: _rules.into_boxed_slice(),
         },
     ))
 }
@@ -285,24 +277,18 @@ pub fn max_extents(entries: &[MagicEntry]) -> usize {
 }
 
 pub fn read_magic_from_file<P: AsRef<Path>>(file_name: P) -> Vec<MagicEntry> {
-    let mut f = match File::open(file_name) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
+    let Ok(mut f) = File::open(file_name) else {
+        return Vec::new();
     };
 
-    let mut magic_buf = Vec::<u8>::new();
+    let mut magic_buf = Vec::new();
 
     f.read_to_end(&mut magic_buf).unwrap();
-    match from_u8_to_entries(magic_buf.as_slice()) {
-        Ok(v) => v.1,
-        Err(_) => Vec::new(),
-    }
+    from_u8_to_entries(magic_buf.as_slice()).map_or_else(|_| Vec::new(), |v| v.1)
 }
 
 pub fn read_magic_from_dir<P: AsRef<Path>>(dir: P) -> Vec<MagicEntry> {
-    let mut magic_file = PathBuf::new();
-    magic_file.push(dir);
-    magic_file.push("magic");
+    let magic_file = dir.as_ref().join("magic");
 
     read_magic_from_file(magic_file)
 }
@@ -315,15 +301,15 @@ mod tests {
 
     #[test]
     fn parse_magic_header() {
-        let res = magic_header(&"[50:application/x-yaml]\n".as_bytes());
+        let res = magic_header(b"[50:application/x-yaml]\n");
 
         match res {
             Ok((i, o)) => {
                 assert_eq!(i.len(), 0);
-                println!("parsed:\n{:?}", o);
+                println!("parsed:\n{o:?}");
             }
             e => {
-                println!("invalid or incomplete: {:?}", e);
+                println!("invalid or incomplete: {e:?}");
                 panic!("cannot parse magic rule");
             }
         }
@@ -338,10 +324,10 @@ mod tests {
         match simple_res {
             Ok((i, o)) => {
                 println!("remaining:\n{}", &i.to_hex_from(8, simple.offset(i)));
-                println!("parsed:\n{:?}", o);
+                println!("parsed:\n{o:?}");
             }
             e => {
-                println!("invalid or incomplete: {:?}", e);
+                println!("invalid or incomplete: {e:?}");
                 panic!("cannot parse magic rule");
             }
         }
@@ -353,10 +339,10 @@ mod tests {
         match range_res {
             Ok((i, o)) => {
                 println!("remaining:\n{}", &i.to_hex_from(8, range.offset(i)));
-                println!("parsed:\n{:?}", o);
+                println!("parsed:\n{o:?}");
             }
             e => {
-                println!("invalid or incomplete: {:?}", e);
+                println!("invalid or incomplete: {e:?}");
                 panic!("cannot parse magic rule");
             }
         }
@@ -368,10 +354,10 @@ mod tests {
         match ws_res {
             Ok((i, o)) => {
                 println!("remaining:\n{}", &i.to_hex_from(8, ws.offset(i)));
-                println!("parsed:\n{:?}", o);
+                println!("parsed:\n{o:?}");
             }
             e => {
-                println!("invalid or incomplete: {:?}", e);
+                println!("invalid or incomplete: {e:?}");
                 panic!("cannot parse magic rule");
             }
         }
@@ -386,10 +372,10 @@ mod tests {
         match res {
             Ok((i, o)) => {
                 println!("remaining:\n{}", &i.to_hex_from(8, data.offset(i)));
-                println!("parsed:\n{:?}", o);
+                println!("parsed:\n{o:?}");
             }
             e => {
-                println!("invalid or incomplete: {:?}", e);
+                println!("invalid or incomplete: {e:?}");
                 panic!("cannot parse magic entry");
             }
         }
@@ -404,10 +390,10 @@ mod tests {
         match res {
             Ok((i, o)) => {
                 println!("remaining:\n{}", &i.to_hex_from(8, data.offset(i)));
-                println!("parsed:\n{:?}", o);
+                println!("parsed:\n{o:?}");
             }
             e => {
-                println!("invalid or incomplete: {:?}", e);
+                println!("invalid or incomplete: {e:?}");
                 panic!("cannot parse magic entry");
             }
         }
@@ -424,7 +410,7 @@ mod tests {
                 println!("parsed {} magic entries:\n{:#?}", o.len(), o);
             }
             e => {
-                println!("invalid or incomplete: {:?}", e);
+                println!("invalid or incomplete: {e:?}");
                 panic!("cannot parse magic file");
             }
         }
@@ -435,7 +421,7 @@ mod tests {
         let rule = MagicRule {
             indent: 0,
             start_offset: 0,
-            value: vec!['h' as u8, 'e' as u8, 'l' as u8, 'l' as u8, 'o' as u8],
+            value: Box::from(*b"hello"),
             mask: None,
             word_size: 1,
             range_length: 30,
@@ -450,7 +436,7 @@ mod tests {
         let rule = MagicRule {
             indent: 0,
             start_offset: 1,
-            value: vec!['h' as u8, 'e' as u8, 'l' as u8, 'l' as u8, 'o' as u8],
+            value: Box::from(*b"hello"),
             mask: None,
             word_size: 1,
             range_length: 30,
@@ -466,7 +452,7 @@ mod tests {
         let rule = MagicRule {
             indent: 0,
             start_offset: 0,
-            value: vec!['h' as u8, 'e' as u8, 'l' as u8, 'l' as u8, 'o' as u8],
+            value: Box::from(*b"hello"),
             mask: None,
             word_size: 1,
             range_length: 10,
@@ -484,7 +470,7 @@ mod tests {
         let rule = MagicRule {
             indent: 0,
             start_offset: 1,
-            value: vec!['h' as u8, 'e' as u8, 'l' as u8, 'l' as u8, 'o' as u8],
+            value: Box::from(*b"hello"),
             mask: None,
             word_size: 1,
             range_length: 3,
@@ -502,8 +488,8 @@ mod tests {
         let rule = MagicRule {
             indent: 0,
             start_offset: 0,
-            value: vec!['h' as u8, 'E' as u8, 'l' as u8, 'l' as u8, 'O' as u8],
-            mask: Some(vec![!0x20; 5]),
+            value: Box::from(*b"hello"),
+            mask: Some(Box::from([!0x20; 5])),
             word_size: 1,
             range_length: 30,
         };

@@ -1,10 +1,11 @@
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use glob::Pattern;
@@ -13,27 +14,26 @@ use unicase::UniCase;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum GlobType {
-    Literal(String),
-    Simple(String),
+    Literal(Box<str>),
+    Simple(Box<str>),
     Full(Pattern),
 }
 
 impl fmt::Debug for GlobType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            GlobType::Literal(name) => write!(f, "Literal '{}'", name),
-            GlobType::Simple(pattern) => write!(f, "Simple glob '*{}'", pattern),
-            GlobType::Full(pattern) => write!(f, "Full glob '{}'", pattern),
+            GlobType::Literal(name) => write!(f, "Literal '{name}'"),
+            GlobType::Simple(pattern) => write!(f, "Simple glob '*{pattern}'"),
+            GlobType::Full(pattern) => write!(f, "Full glob '{pattern}'"),
         }
     }
 }
 
-impl fmt::Display for GlobType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl GlobType {
+    fn as_str(&self) -> &str {
         match self {
-            GlobType::Literal(str) => write!(f, "{}", str),
-            GlobType::Simple(str) => write!(f, "{}", str),
-            GlobType::Full(pattern) => write!(f, "{}", pattern),
+            GlobType::Literal(str) | GlobType::Simple(str) => str,
+            GlobType::Full(pattern) => pattern.as_str(),
         }
     }
 }
@@ -50,9 +50,9 @@ fn determine_type(glob: &str) -> GlobType {
     }
 
     if maybe_simple {
-        GlobType::Simple(glob[1..].to_string())
+        GlobType::Simple(glob[1..].into())
     } else {
-        GlobType::Literal(glob.to_string())
+        GlobType::Literal(glob.into())
     }
 }
 
@@ -75,7 +75,7 @@ impl Eq for Glob {}
 impl Hash for Glob {
     fn hash<H: Hasher>(&self, h: &mut H) {
         self.glob.hash(h);
-        self.mime_type.hash(h)
+        self.mime_type.hash(h);
     }
 }
 
@@ -90,37 +90,27 @@ impl fmt::Debug for Glob {
 }
 
 impl Glob {
-    pub fn simple(mime_type: &Mime, glob: &str) -> Glob {
-        Glob {
-            mime_type: mime_type.clone(),
-            glob: determine_type(glob),
-            weight: 50,
-            case_sensitive: false,
-        }
+    pub fn simple(mime_type: Mime, glob: &str) -> Glob {
+        Glob::with_weight(mime_type, glob, 50)
     }
 
-    pub fn with_weight(mime_type: &Mime, glob: &str, weight: i32) -> Glob {
-        Glob {
-            mime_type: mime_type.clone(),
-            glob: determine_type(glob),
-            weight,
-            case_sensitive: false,
-        }
+    pub fn with_weight(mime_type: Mime, glob: &str, weight: i32) -> Glob {
+        Glob::new(mime_type, glob, weight, false)
     }
 
-    pub fn new(mime_type: &Mime, glob: &str, weight: i32, cs: bool) -> Glob {
+    pub fn new(mime_type: Mime, glob: &str, weight: i32, case_sensitive: bool) -> Glob {
         Glob {
-            mime_type: mime_type.clone(),
+            mime_type,
             glob: determine_type(glob),
             weight,
-            case_sensitive: cs,
+            case_sensitive,
         }
     }
 
     pub fn from_v1_string(s: &str) -> Option<Glob> {
-        let mut chunks = s.split(':').fuse();
+        let mut chunks = s.split(':');
         let mime_type = chunks.next().and_then(|s| Mime::from_str(s).ok())?;
-        let glob = chunks.next().filter(|s| !s.is_empty())?;
+        let glob = chunks.next().filter(|&s| !s.is_empty())?;
 
         // The globs file is not extensible, so consume any
         // leftover tokens
@@ -128,15 +118,15 @@ impl Glob {
             return None;
         }
 
-        Some(Glob::new(&mime_type, glob, 50, false))
+        Some(Glob::simple(mime_type, glob))
     }
 
     pub fn from_v2_string(s: &str) -> Option<Glob> {
-        let mut chunks = s.split(':').fuse();
+        let mut chunks = s.split(':');
 
         let weight = chunks
             .next()
-            .and_then(|v| v.parse::<i32>().ok())
+            .and_then(|v| i32::from_str(v).ok())
             .filter(|n| *n >= 0)?;
 
         let mime_type = chunks.next().and_then(|s| Mime::from_str(s).ok())?;
@@ -144,10 +134,8 @@ impl Glob {
 
         let mut case_sensitive = false;
         if let Some(flags) = chunks.next() {
-            let flags_chunks = flags.split(',').collect::<Vec<&str>>();
-
             // Allow for extra flags
-            if flags_chunks.iter().any(|&f| f == "cs") {
+            if flags.split(',').any(|x| x == "cs") {
                 case_sensitive = true;
             }
         }
@@ -156,7 +144,7 @@ impl Glob {
         //
         // https://specifications.freedesktop.org/shared-mime-info-spec/shared-mime-info-spec-latest.html#idm46152099256048
 
-        Some(Glob::new(&mime_type, glob, weight, case_sensitive))
+        Some(Glob::new(mime_type, glob, weight, case_sensitive))
     }
 
     fn compare(&self, file_name: &str) -> bool {
@@ -168,13 +156,13 @@ impl Glob {
                 return a == b;
             }
             GlobType::Simple(s) => {
-                if file_name.ends_with(s) {
+                if file_name.ends_with(s.as_ref()) {
                     return true;
                 }
 
                 if !self.case_sensitive {
                     let lc_file_name = file_name.to_lowercase();
-                    if lc_file_name.ends_with(s) {
+                    if lc_file_name.ends_with(s.as_ref()) {
                         return true;
                     }
                 }
@@ -189,9 +177,8 @@ impl Glob {
 }
 
 pub fn read_globs_v1_from_file<P: AsRef<Path>>(file_name: P) -> Option<Vec<Glob>> {
-    let f = match File::open(file_name) {
-        Ok(v) => v,
-        Err(_) => return None,
+    let Ok(f) = File::open(file_name) else {
+        return None;
     };
 
     let mut res = Vec::new();
@@ -207,9 +194,8 @@ pub fn read_globs_v1_from_file<P: AsRef<Path>>(file_name: P) -> Option<Vec<Glob>
             continue;
         }
 
-        match Glob::from_v1_string(&line) {
-            Some(v) => res.push(v),
-            None => continue,
+        if let Some(glob) = Glob::from_v1_string(&line) {
+            res.push(glob);
         }
     }
 
@@ -217,9 +203,8 @@ pub fn read_globs_v1_from_file<P: AsRef<Path>>(file_name: P) -> Option<Vec<Glob>
 }
 
 pub fn read_globs_v2_from_file<P: AsRef<Path>>(file_name: P) -> Option<Vec<Glob>> {
-    let f = match File::open(file_name) {
-        Ok(v) => v,
-        Err(_) => return None,
+    let Ok(f) = File::open(file_name) else {
+        return None;
     };
 
     let mut res = Vec::new();
@@ -235,9 +220,8 @@ pub fn read_globs_v2_from_file<P: AsRef<Path>>(file_name: P) -> Option<Vec<Glob>
             continue;
         }
 
-        match Glob::from_v2_string(&line) {
-            Some(v) => res.push(v),
-            None => continue,
+        if let Some(glob) = Glob::from_v2_string(&line) {
+            res.push(glob);
         }
     }
 
@@ -245,72 +229,63 @@ pub fn read_globs_v2_from_file<P: AsRef<Path>>(file_name: P) -> Option<Vec<Glob>
 }
 
 pub fn read_globs_from_dir<P: AsRef<Path>>(dir: P) -> Vec<Glob> {
-    let mut globs_file = PathBuf::new();
-    globs_file.push(dir);
-    globs_file.push("globs2");
+    let mut globs_file = dir.as_ref().join("globs2");
 
-    match read_globs_v2_from_file(&globs_file) {
-        Some(v) => v,
-        None => {
-            globs_file.pop();
-            globs_file.push("globs");
-
-            read_globs_v1_from_file(globs_file).unwrap_or_default()
-        }
-    }
+    read_globs_v2_from_file(&globs_file).unwrap_or_else(|| {
+        globs_file.pop();
+        globs_file.push("globs");
+        read_globs_v1_from_file(globs_file).unwrap_or_default()
+    })
 }
 
+#[derive(Default)]
 pub struct GlobMap {
     globs: HashSet<Glob>,
 }
 
 impl GlobMap {
     pub fn new() -> GlobMap {
-        GlobMap {
-            globs: HashSet::new(),
-        }
+        GlobMap::default()
     }
 
     pub fn add_glob(&mut self, glob: Glob) {
         self.globs.insert(glob);
     }
 
-    pub fn add_globs(&mut self, globs: &[Glob]) {
-        self.globs.extend(globs.iter().cloned());
+    pub fn add_globs(&mut self, globs: impl IntoIterator<Item = Glob>) {
+        self.globs.extend(globs);
     }
 
     pub fn lookup_mime_type_for_file_name(&self, file_name: &str) -> Option<Vec<Mime>> {
-        let mut matching_globs = Vec::new();
-
-        for glob in &self.globs {
-            if glob.compare(file_name) {
-                matching_globs.push(glob.clone());
-            }
-        }
+        let mut matching_globs: Vec<_> = self
+            .globs
+            .iter()
+            .filter(|&glob| glob.compare(file_name))
+            .collect();
 
         // Sort in descending order by weight
-        matching_globs.sort_by(|a, b| b.weight.cmp(&a.weight));
+        matching_globs.sort_unstable_by_key(|&glob| Reverse(glob.weight));
 
         let biggest_weight = matching_globs.first()?.weight;
 
         // "Keep only globs with the biggest weight."
         // -- shared-mime-info, "Recommended checking order"
         let matching_globs = matching_globs
-            .iter()
-            .filter(|glob| glob.weight == biggest_weight);
+            .into_iter()
+            .filter(|&glob| glob.weight == biggest_weight);
 
         // Needs to be after filtering for biggest weight
         // in case it changes which glob is the longest.
         let biggest_glob_length = matching_globs
             .clone()
-            .map(|glob| glob.glob.to_string().len())
+            .map(|glob| glob.glob.as_str().len())
             .max()?;
 
         // "If the patterns are different, keep only the globs
         // with the longest pattern, as previously discussed."
         // -- shared-mime-info, "Recommended checking order"
         let res = matching_globs
-            .filter(|glob| glob.glob.to_string().len() == biggest_glob_length)
+            .filter(|&glob| glob.glob.as_str().len() == biggest_glob_length)
             .map(|glob| glob.mime_type.clone())
             .collect();
 
@@ -324,13 +299,8 @@ impl GlobMap {
 
 impl fmt::Debug for GlobMap {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut lines = String::new();
-        for glob in &self.globs {
-            lines.push_str(&format!("{:?}", glob));
-            lines.push('\n');
-        }
-
-        write!(f, "Globs:\n{}", lines)
+        f.write_str("Globs:\n")?;
+        self.globs.fmt(f)
     }
 }
 
@@ -340,10 +310,7 @@ mod tests {
 
     #[test]
     fn glob_type() {
-        assert_eq!(
-            determine_type("*.gif"),
-            GlobType::Simple(".gif".to_string())
-        );
+        assert_eq!(determine_type("*.gif"), GlobType::Simple(".gif".into()));
         assert_eq!(
             determine_type("Foo*.gif"),
             GlobType::Full(Pattern::new("Foo*.gif").unwrap())
@@ -354,7 +321,7 @@ mod tests {
         );
         assert_eq!(
             determine_type("Makefile"),
-            GlobType::Literal("Makefile".to_string())
+            GlobType::Literal("Makefile".into())
         );
         assert_eq!(
             determine_type("sldkfjvlsdf\\\\slkdjf"),
@@ -370,16 +337,11 @@ mod tests {
     fn glob_v1_string() {
         assert_eq!(
             Glob::from_v1_string("text/rust:*.rs"),
-            Some(Glob::simple(&Mime::from_str("text/rust").unwrap(), "*.rs"))
+            Some(Glob::simple("text/rust".parse().unwrap(), "*.rs"))
         );
         assert_eq!(
             Glob::from_v1_string("text/rust:*.rs"),
-            Some(Glob::new(
-                &Mime::from_str("text/rust").unwrap(),
-                "*.rs",
-                50,
-                false
-            ))
+            Some(Glob::new("text/rust".parse().unwrap(), "*.rs", 50, false))
         );
 
         assert_eq!(Glob::from_v1_string(""), None);
@@ -394,29 +356,15 @@ mod tests {
     fn glob_v2_string() {
         assert_eq!(
             Glob::from_v2_string("80:text/rust:*.rs"),
-            Some(Glob::with_weight(
-                &Mime::from_str("text/rust").unwrap(),
-                "*.rs",
-                80
-            ))
+            Some(Glob::with_weight("text/rust".parse().unwrap(), "*.rs", 80))
         );
         assert_eq!(
             Glob::from_v2_string("80:text/rust:*.rs"),
-            Some(Glob::new(
-                &Mime::from_str("text/rust").unwrap(),
-                "*.rs",
-                80,
-                false
-            ))
+            Some(Glob::new("text/rust".parse().unwrap(), "*.rs", 80, false))
         );
         assert_eq!(
             Glob::from_v2_string("50:text/x-c++src:*.C:cs"),
-            Some(Glob::new(
-                &Mime::from_str("text/x-c++src").unwrap(),
-                "*.C",
-                50,
-                true
-            ))
+            Some(Glob::new("text/x-c++src".parse().unwrap(), "*.C", 50, true))
         );
 
         assert_eq!(Glob::from_v2_string(""), None);
@@ -429,47 +377,32 @@ mod tests {
 
         assert_eq!(
             Glob::from_v2_string("50:text/x-c++src:*.C:cs,newflag:newfeature:somethingelse"),
-            Some(Glob::new(
-                &Mime::from_str("text/x-c++src").unwrap(),
-                "*.C",
-                50,
-                true
-            ))
+            Some(Glob::new("text/x-c++src".parse().unwrap(), "*.C", 50, true))
         );
     }
 
     #[test]
     fn compare() {
         // Literal
-        let copying = Glob::new(
-            &Mime::from_str("text/x-copying").unwrap(),
-            "copying",
-            50,
-            false,
-        );
-        assert_eq!(copying.compare(&"COPYING".to_string()), true);
+        let copying = Glob::new("text/x-copying".parse().unwrap(), "copying", 50, false);
+        assert!(copying.compare("COPYING"));
 
         // Simple, case-insensitive
-        let c_src = Glob::new(&Mime::from_str("text/x-csrc").unwrap(), "*.c", 50, false);
-        assert_eq!(c_src.compare(&"foo.c".to_string()), true);
-        assert_eq!(c_src.compare(&"FOO.C".to_string()), true);
+        let c_src = Glob::new("text/x-csrc".parse().unwrap(), "*.c", 50, false);
+        assert!(c_src.compare("foo.c"));
+        assert!(c_src.compare("FOO.C"));
 
         // Simple, case-sensitive
-        let cplusplus_src = Glob::new(&Mime::from_str("text/x-c++src").unwrap(), "*.C", 50, true);
-        assert_eq!(cplusplus_src.compare(&"foo.C".to_string()), true);
-        assert_eq!(cplusplus_src.compare(&"foo.c".to_string()), false);
-        assert_eq!(cplusplus_src.compare(&"foo.h".to_string()), false);
+        let cplusplus_src = Glob::new("text/x-c++src".parse().unwrap(), "*.C", 50, true);
+        assert!(cplusplus_src.compare("foo.C"));
+        assert!(!cplusplus_src.compare("foo.c"));
+        assert!(!cplusplus_src.compare("foo.h"));
 
         // Full
-        let video_x_anim = Glob::new(
-            &Mime::from_str("video/x-anim").unwrap(),
-            "*.anim[1-9j]",
-            50,
-            false,
-        );
-        assert_eq!(video_x_anim.compare(&"foo.anim0".to_string()), false);
-        assert_eq!(video_x_anim.compare(&"foo.anim8".to_string()), true);
-        assert_eq!(video_x_anim.compare(&"foo.animk".to_string()), false);
-        assert_eq!(video_x_anim.compare(&"foo.animj".to_string()), true);
+        let video_x_anim = Glob::new("video/x-anim".parse().unwrap(), "*.anim[1-9j]", 50, false);
+        assert!(!video_x_anim.compare("foo.anim0"));
+        assert!(video_x_anim.compare("foo.anim8"));
+        assert!(!video_x_anim.compare("foo.animk"));
+        assert!(video_x_anim.compare("foo.animj"));
     }
 }

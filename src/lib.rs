@@ -65,9 +65,9 @@
 
 use mime::Mime;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
-use std::fs::File;
-use std::io::prelude::*;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -82,7 +82,7 @@ mod parent;
 
 #[derive(Clone, PartialEq)]
 struct MimeDirectory {
-    path: PathBuf,
+    path: Box<Path>,
     mtime: SystemTime,
 }
 
@@ -111,7 +111,6 @@ pub struct SharedMimeInfo {
 ///
 /// ```rust
 /// # use std::error::Error;
-/// # use std::str::FromStr;
 /// # use mime::Mime;
 /// #
 /// # fn main() -> Result<(), Box<dyn Error>> {
@@ -119,7 +118,7 @@ pub struct SharedMimeInfo {
 /// // let mime_db = ...
 /// let mut guess_builder = mime_db.guess_mime_type();
 /// let guess = guess_builder.file_name("foo.png").guess();
-/// assert_eq!(guess.mime_type(), &Mime::from_str("image/png")?);
+/// assert_eq!(*guess.mime_type(), "image/png");
 /// #
 /// # Ok(())
 /// # }
@@ -141,10 +140,10 @@ pub struct SharedMimeInfo {
 /// [`uncertain`]: struct.Guess.html#method.uncertain
 pub struct GuessBuilder<'a> {
     db: &'a SharedMimeInfo,
-    file_name: Option<String>,
+    file_name: Option<Box<str>>,
     data: Vec<u8>,
     metadata: Option<fs::Metadata>,
-    path: Option<PathBuf>,
+    path: Option<Box<Path>>,
     zero_size: bool,
 }
 
@@ -157,7 +156,7 @@ pub struct Guess {
     uncertain: bool,
 }
 
-impl<'a> GuessBuilder<'a> {
+impl GuessBuilder<'_> {
     /// Sets the file name to be used to guess its MIME type.
     ///
     /// If you have a full path, you should extract the last component,
@@ -166,7 +165,7 @@ impl<'a> GuessBuilder<'a> {
     ///
     /// [path_file_name]: https://doc.rust-lang.org/std/path/struct.Path.html#method.file_name
     pub fn file_name(&mut self, name: &str) -> &mut Self {
-        self.file_name = Some(name.to_string());
+        self.file_name = Some(name.into());
 
         self
     }
@@ -177,9 +176,9 @@ impl<'a> GuessBuilder<'a> {
         // necessary to match any rule in the magic entries
         let max_data_size = magic::max_extents(&self.db.magic);
         if data.len() > max_data_size {
-            self.data.extend_from_slice(&data[..max_data_size]);
+            self.data.extend(&data[..max_data_size]);
         } else {
-            self.data.extend(data.iter().cloned());
+            self.data.extend(data);
         }
 
         self
@@ -192,7 +191,6 @@ impl<'a> GuessBuilder<'a> {
     /// ```rust
     /// # use std::error::Error;
     /// use std::fs;
-    /// use std::str::FromStr;
     /// use mime::Mime;
     /// #
     /// # fn main() -> Result<(), Box<dyn Error>> {
@@ -205,12 +203,12 @@ impl<'a> GuessBuilder<'a> {
     ///     .file_name("lib.rs")
     ///     .metadata(metadata)
     ///     .guess();
-    /// assert_eq!(guess.mime_type(), &Mime::from_str("text/rust")?);
+    /// assert_eq!(*guess.mime_type(), "text/rust");
     /// #
     /// # Ok(())
     /// # }
     /// ```
-    pub fn metadata(&mut self, metadata: fs::Metadata) -> &mut Self {
+    pub const fn metadata(&mut self, metadata: fs::Metadata) -> &mut Self {
         self.metadata = Some(metadata);
 
         self
@@ -235,7 +233,7 @@ impl<'a> GuessBuilder<'a> {
     /// let guess = guess_builder
     ///     .path("src")
     ///     .guess();
-    /// assert_eq!(guess.mime_type(), &Mime::from_str("inode/directory")?);
+    /// assert_eq!(*guess.mime_type(), "inode/directory");
     /// #
     /// # Ok(())
     /// # }
@@ -246,10 +244,7 @@ impl<'a> GuessBuilder<'a> {
     /// [`metadata`]: #method.metadata
     /// [`data`]: #method.data
     pub fn path<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
-        let mut buf = PathBuf::new();
-        buf.push(path);
-
-        self.path = Some(buf);
+        self.path = Some(path.as_ref().into());
 
         self
     }
@@ -263,8 +258,9 @@ impl<'a> GuessBuilder<'a> {
     /// Defaults to true.
     ///
     /// [`guess`]: #method.guess
-    pub fn zero_size(&mut self, allow: bool) -> &mut Self {
+    pub const fn zero_size(&mut self, allow: bool) -> &mut Self {
         self.zero_size = allow;
+
         self
     }
 
@@ -277,56 +273,12 @@ impl<'a> GuessBuilder<'a> {
         if let Some(path) = &self.path {
             // Fill out the metadata
             if self.metadata.is_none() {
-                self.metadata = match fs::metadata(path) {
-                    Ok(m) => Some(m),
-                    Err(_) => None,
-                };
-            }
-
-            fn load_data_chunk<P: AsRef<Path>>(path: P, chunk_size: usize) -> Option<Vec<u8>> {
-                if chunk_size == 0 {
-                    return None;
-                }
-
-                let mut f = match File::open(&path) {
-                    Ok(file) => file,
-                    Err(_) => return None,
-                };
-
-                let mut buf = vec![0u8; chunk_size];
-
-                if f.read_exact(&mut buf).is_err() {
-                    return None;
-                }
-
-                Some(buf)
-            }
-
-            // Load the minimum amount of data necessary for a match
-            if self.data.is_empty() {
-                let mut max_data_size = magic::max_extents(&self.db.magic);
-
-                if let Some(metadata) = &self.metadata {
-                    let file_size: usize = metadata.len() as usize;
-                    if file_size < max_data_size {
-                        max_data_size = file_size;
-                    }
-                }
-
-                match load_data_chunk(path, max_data_size) {
-                    Some(v) => self.data.extend(v),
-                    None => self.data.clear(),
-                }
+                self.metadata = fs::metadata(path).ok();
             }
 
             // Set the file name
             if self.file_name.is_none() {
-                if let Some(file_name) = path.file_name() {
-                    self.file_name = match file_name.to_os_string().into_string() {
-                        Ok(v) => Some(v),
-                        Err(_) => None,
-                    };
-                }
+                self.file_name = path.file_name().and_then(OsStr::to_str).map(Box::from);
             }
         }
 
@@ -336,7 +288,7 @@ impl<'a> GuessBuilder<'a> {
             // Special type for directories
             if file_type.is_dir() {
                 return Guess {
-                    mime: "inode/directory".parse::<mime::Mime>().unwrap(),
+                    mime: "inode/directory".parse().unwrap(),
                     uncertain: true,
                 };
             }
@@ -344,7 +296,7 @@ impl<'a> GuessBuilder<'a> {
             // Special type for symbolic links
             if file_type.is_symlink() {
                 return Guess {
-                    mime: "inode/symlink".parse::<mime::Mime>().unwrap(),
+                    mime: "inode/symlink".parse().unwrap(),
                     uncertain: true,
                 };
             }
@@ -352,107 +304,113 @@ impl<'a> GuessBuilder<'a> {
             // Special type for empty files
             if self.zero_size && metadata.len() == 0 {
                 return Guess {
-                    mime: "application/x-zerosize".parse::<mime::Mime>().unwrap(),
+                    mime: "application/x-zerosize".parse().unwrap(),
                     uncertain: true,
                 };
             }
         }
 
-        let name_mime_types: Vec<mime::Mime> = match &self.file_name {
-            Some(file_name) => self.db.get_mime_types_from_file_name(file_name),
-            None => Vec::new(),
+        let name_mime_types_opt = if let Some(file_name) = self.file_name.as_ref() {
+            Some(
+                if let Some(name_mime_types) =
+                    self.db.globs.lookup_mime_type_for_file_name(file_name)
+                {
+                    // Try to return early if the file name matches with no conflicts
+                    match <[_; 1]>::try_from(name_mime_types) {
+                        Ok([mime]) => return Guess::new_certain(mime), // File name match, and no conflicts
+                        Err(name_mime_types) => Some(name_mime_types), // File name matches with conflicts
+                    }
+                } else {
+                    None // No file name match
+                },
+            )
+        } else {
+            None // No file name
         };
 
-        // File name match, and no conflicts
-        if name_mime_types.len() == 1 && name_mime_types[0] != mime::APPLICATION_OCTET_STREAM {
-            return Guess {
-                mime: name_mime_types[0].clone(),
-                uncertain: false,
-            };
-        }
+        if let Some(path) = &self.path {
+            fn load_data_chunk<P: AsRef<Path>>(path: P, chunk_size: usize) -> Option<Vec<u8>> {
+                if chunk_size == 0 {
+                    return None;
+                }
 
-        let sniffed_mime = self
-            .db
-            .get_mime_type_for_data(&self.data)
-            .unwrap_or((mime::APPLICATION_OCTET_STREAM, 80));
+                let mut f = fs::File::open(&path).ok()?;
+                let mut buf = vec![0u8; chunk_size];
+                f.read_exact(&mut buf).ok()?;
 
-        if name_mime_types.is_empty() {
-            // No names and no data => unknown MIME type
+                Some(buf)
+            }
+
+            // Load the minimum amount of data necessary for a match
             if self.data.is_empty() {
-                return Guess {
-                    mime: mime::APPLICATION_OCTET_STREAM,
-                    uncertain: true,
-                };
-            }
+                let mut max_data_size = magic::max_extents(&self.db.magic);
 
-            return Guess {
-                mime: sniffed_mime.0.clone(),
-                uncertain: sniffed_mime.0 == mime::APPLICATION_OCTET_STREAM,
-            };
-        } else {
-            let (mut mime, priority) = sniffed_mime;
-
-            // "If no magic rule matches the data (or if the content is not
-            // available), use the default type of application/octet-stream
-            // for binary data, or text/plain for textual data."
-            // -- shared-mime-info, "Recommended checking order"
-            if mime == mime::APPLICATION_OCTET_STREAM
-                && !self.data.is_empty()
-                && looks_like_text(&self.data)
-            {
-                mime = mime::TEXT_PLAIN;
-            }
-
-            // From the content type guessing implementation in GIO:
-            //
-            // For security reasons we don't ever want to sniff desktop files
-            // where we know the filename and it doesn't have a .desktop extension.
-            // This is because desktop files allow executing any application and
-            // we don't want to make it possible to hide them looking like something
-            // else.
-            if self.file_name.is_some() {
-                let x_desktop = "application/x-desktop".parse::<mime::Mime>().unwrap();
-
-                if mime == x_desktop {
-                    mime = mime::TEXT_PLAIN;
-                }
-            }
-
-            if mime != mime::APPLICATION_OCTET_STREAM {
-                // We found a match with a high confidence value
-                if priority >= 80 {
-                    return Guess {
-                        mime,
-                        uncertain: false,
-                    };
+                if let Some(metadata) = &self.metadata {
+                    max_data_size = max_data_size.min(metadata.len() as usize);
                 }
 
-                // We have possible conflicts, but the data matches the
-                // file name, so let's see if the sniffed MIME type is
-                // a subclass of the MIME type associated to the file name,
-                // and use that as a tie breaker.
-                if name_mime_types
-                    .iter()
-                    .any(|m| self.db.mime_type_subclass(&mime, m))
-                {
-                    return Guess {
-                        mime,
-                        uncertain: false,
-                    };
+                if let Some(data) = load_data_chunk(path, max_data_size) {
+                    self.data = data;
                 }
-            }
-
-            // If there are conflicts, and the data does not help us,
-            // we just pick the first result
-            if let Some(mime_type) = name_mime_types.first() {
-                return Guess {
-                    mime: mime_type.clone(),
-                    uncertain: true,
-                };
             }
         }
 
-        // Okay, we give up
+        let sniffed_mime_opt = self.db.get_mime_type_for_data(&self.data);
+
+        if let Some(name_mime_types_opt) = name_mime_types_opt {
+            if let Some((mime, priority)) = sniffed_mime_opt {
+                // From the content type guessing implementation in GIO:
+                //
+                // For security reasons we don't ever want to sniff desktop files
+                // where we know the filename and it doesn't have a .desktop extension.
+                // This is because desktop files allow executing any application and
+                // we don't want to make it possible to hide them looking like something
+                // else.
+                if mime == "application/x-desktop" {
+                    return Guess::new_certain(mime::TEXT_PLAIN);
+                }
+
+                // We found a match with a high confidence value
+                if priority >= 80 || name_mime_types_opt.is_none() {
+                    return Guess::new_certain(mime);
+                }
+
+                if let Some(name_mime_types) = name_mime_types_opt.as_ref() {
+                    // We have possible conflicts, but the data matches the
+                    // file name, so let's see if the sniffed MIME type is
+                    // a subclass of the MIME type associated to the file name,
+                    // and use that as a tie breaker.
+                    if name_mime_types
+                        .iter()
+                        .any(|m| self.db.mime_type_subclass(&mime, m))
+                    {
+                        return Guess::new_certain(mime);
+                    }
+                }
+            } else if !self.data.is_empty() && looks_like_text(&self.data) {
+                // "If no magic rule matches the data (or if the content is not
+                // available), use the default type of application/octet-stream
+                // for binary data, or text/plain for textual data."
+                // -- shared-mime-info, "Recommended checking order"
+                return Guess::new_certain(mime::TEXT_PLAIN);
+            }
+
+            if let Some(name_mime_types) = name_mime_types_opt {
+                // If there are conflicts, and the data does not help us,
+                // we just pick the first result
+                return Guess {
+                    mime: name_mime_types.into_iter().next().unwrap(),
+                    uncertain: true,
+                };
+            }
+        } else if !self.data.is_empty() {
+            // No name but has data => return sniffed mime
+            if let Some((mime, _)) = sniffed_mime_opt {
+                return Guess::new_certain(mime);
+            }
+        }
+        // No names and no data => unknown MIME type
+
         Guess {
             mime: mime::APPLICATION_OCTET_STREAM,
             uncertain: true,
@@ -465,15 +423,14 @@ fn looks_like_text(data: &[u8]) -> bool {
     // control characters is a good way to guess whether a
     // file is binary or text."
     // -- shared-mime-info, "Recommended checking order"
-    !data
-        .iter()
+    data.iter()
         .take(128)
-        .any(|ch| ch.is_ascii_control() && !ch.is_ascii_whitespace())
+        .all(|ch| !ch.is_ascii_control() || ch.is_ascii_whitespace())
 }
 
 impl Guess {
     /// The guessed MIME type.
-    pub fn mime_type(&self) -> &mime::Mime {
+    pub const fn mime_type(&self) -> &mime::Mime {
         &self.mime
     }
 
@@ -489,8 +446,15 @@ impl Guess {
     ///
     /// [`mime_type`]: #method.mime_type
     /// [`get_mime_types_from_file_name`]: struct.SharedMimeInfo.html#method.get_mime_types_from_file_name
-    pub fn uncertain(&self) -> bool {
+    pub const fn uncertain(&self) -> bool {
         self.uncertain
+    }
+
+    const fn new_certain(mime: mime::Mime) -> Self {
+        Self {
+            mime,
+            uncertain: false,
+        }
     }
 }
 
@@ -513,45 +477,36 @@ impl SharedMimeInfo {
         }
     }
 
-    fn load_directory<P: AsRef<Path>>(&mut self, directory: P) {
-        let mut mime_path = PathBuf::new();
-        mime_path.push(directory);
-        mime_path.push("mime");
+    fn load_directory(&mut self, mut directory: PathBuf) {
+        directory.push("mime");
+        let mime_path = directory.into_boxed_path();
 
         let aliases = alias::read_aliases_from_dir(&mime_path);
         self.aliases.add_aliases(aliases);
 
-        let icons = icon::read_icons_from_dir(&mime_path, false);
-        self.icons.extend(icons);
+        let mut icons = icon::read_icons_from_dir(&mime_path, false);
+        self.icons.append(&mut icons);
 
-        let generic_icons = icon::read_icons_from_dir(&mime_path, true);
-        self.generic_icons.extend(generic_icons);
+        let mut generic_icons = icon::read_icons_from_dir(&mime_path, true);
+        self.generic_icons.append(&mut generic_icons);
 
         let subclasses = parent::read_subclasses_from_dir(&mime_path);
         self.parents.add_subclasses(subclasses);
 
         let globs = glob::read_globs_from_dir(&mime_path);
-        self.globs.add_globs(&globs);
+        self.globs.add_globs(globs);
 
-        let magic_entries = magic::read_magic_from_dir(&mime_path);
-        self.magic.extend(magic_entries);
+        let mut magic_entries = magic::read_magic_from_dir(&mime_path);
+        self.magic.append(&mut magic_entries);
 
-        let mime_dir = match fs::metadata(&mime_path) {
-            Ok(v) => {
-                let mtime = v.modified().unwrap_or_else(|_| SystemTime::now());
+        let mtime = fs::metadata(&mime_path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or_else(|_| SystemTime::now());
 
-                MimeDirectory {
-                    path: mime_path,
-                    mtime,
-                }
-            }
-            Err(_) => MimeDirectory {
-                path: mime_path,
-                mtime: SystemTime::now(),
-            },
-        };
-
-        self.mime_dirs.push(mime_dir);
+        self.mime_dirs.push(MimeDirectory {
+            path: mime_path,
+            mtime,
+        });
     }
 
     /// Creates a new `SharedMimeInfo` instance containing all MIME information
@@ -573,7 +528,7 @@ impl SharedMimeInfo {
         };
 
         for dir in data_dirs {
-            db.load_directory(dir)
+            db.load_directory(dir);
         }
 
         db
@@ -590,7 +545,7 @@ impl SharedMimeInfo {
     pub fn new_for_directory<P: AsRef<Path>>(directory: P) -> SharedMimeInfo {
         let mut db = SharedMimeInfo::create();
 
-        db.load_directory(directory);
+        db.load_directory(directory.as_ref().to_path_buf());
 
         db
     }
@@ -612,40 +567,38 @@ impl SharedMimeInfo {
 
         // Do not reload the data if nothing has changed
         for dir in &self.mime_dirs {
-            let mtime = match fs::metadata(&dir.path) {
-                Ok(v) => v.modified().unwrap_or(dir.mtime),
-                Err(_) => dir.mtime,
-            };
+            let mtime =
+                fs::metadata(&dir.path).map_or(dir.mtime, |v| v.modified().unwrap_or(dir.mtime));
 
             // Drop everything if a directory was changed since
             // the last time we looked into it
             if dir.mtime < mtime {
                 dropped_db = true;
-
-                self.aliases.clear();
-                self.parents.clear();
-                self.globs.clear();
-                self.icons.clear();
-                self.generic_icons.clear();
-                self.magic.clear();
-
                 break;
             }
         }
 
         if dropped_db {
-            let mime_dirs: Vec<MimeDirectory> = self.mime_dirs.to_vec();
+            for dir in &mut self.mime_dirs {
+                let aliases = alias::read_aliases_from_dir(&dir.path);
+                self.aliases.clear();
+                self.aliases.add_aliases(aliases);
 
-            self.mime_dirs.clear();
+                let subclasses = parent::read_subclasses_from_dir(&dir.path);
+                self.parents.clear();
+                self.parents.add_subclasses(subclasses);
 
-            for dir in &mime_dirs {
-                // Pop the `mime` chunk, since load_directory() will
-                // automatically add it back
-                let mut base_dir = PathBuf::new();
-                base_dir.push(&dir.path);
-                base_dir.pop();
+                let globs = glob::read_globs_from_dir(&dir.path);
+                self.globs.clear();
+                self.globs.add_globs(globs);
 
-                self.load_directory(base_dir);
+                self.icons = icon::read_icons_from_dir(&dir.path, false);
+                self.generic_icons = icon::read_icons_from_dir(&dir.path, true);
+                self.magic = magic::read_magic_from_dir(&dir.path);
+
+                dir.mtime = fs::metadata(&dir.path)
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or_else(|_| SystemTime::now());
             }
         }
 
@@ -666,18 +619,17 @@ impl SharedMimeInfo {
         let mut res = Vec::new();
 
         if let Some(v) = icon::find_icon(&self.icons, mime_type) {
-            res.push(v);
-        };
+            res.push(v.to_string());
+        }
 
         res.push(mime_type.essence_str().replace('/', "-"));
 
-        match icon::find_icon(&self.generic_icons, mime_type) {
-            Some(v) => res.push(v),
-            None => {
-                let generic = format!("{}-x-generic", mime_type.type_());
-                res.push(generic);
-            }
-        };
+        if let Some(v) = icon::find_icon(&self.generic_icons, mime_type) {
+            res.push(v.to_string());
+        } else {
+            let generic = format!("{}-x-generic", mime_type.type_());
+            res.push(generic);
+        }
 
         res
     }
@@ -688,28 +640,23 @@ impl SharedMimeInfo {
     ///
     /// [xdg-icon-theme]: https://specifications.freedesktop.org/icon-theme-spec/icon-theme-spec-latest.html
     pub fn lookup_generic_icon_name(&self, mime_type: &Mime) -> Option<String> {
-        let res = match icon::find_icon(&self.generic_icons, mime_type) {
-            Some(v) => v,
-            None => format!("{}-x-generic", mime_type.type_()),
-        };
+        let res = icon::find_icon(&self.generic_icons, mime_type).map_or_else(
+            || format!("{}-x-generic", mime_type.type_()),
+            str::to_string,
+        );
 
         Some(res)
     }
 
     /// Retrieves all the parent MIME types associated to `mime_type`.
     pub fn get_parents(&self, mime_type: &Mime) -> Option<Vec<Mime>> {
-        let unaliased = match self.aliases.unalias_mime_type(mime_type) {
-            Some(v) => v,
-            None => return None,
-        };
+        let unaliased = self.aliases.unalias_mime_type(mime_type)?;
 
         let mut res = vec![unaliased.clone()];
 
         if let Some(parents) = self.parents.lookup(&unaliased) {
-            for parent in parents {
-                res.push(parent.clone());
-            }
-        };
+            res.extend(parents.iter().cloned());
+        }
 
         Some(res)
     }
@@ -718,25 +665,18 @@ impl SharedMimeInfo {
     /// You may want to use this to get a list of sub-classes, eg:
     ///
     /// ```rust
-    /// use mime::Mime;
-    /// use xdg_mime::SharedMimeInfo;
-    ///
-    /// let parents = (SharedMimeInfo::new()).get_parents_aliased(&Mime::from_str("application/toml")?)?;
+    /// # use mime::Mime;
+    /// # let mime_db = xdg_mime::SharedMimeInfo::new();
+    /// // let mime_db = ...
+    /// let mime = "application/toml".parse().unwrap();
+    /// let parents = mime_db.get_parents_aliased(&mime).unwrap();
     /// assert!(parents.contains(&mime::TEXT_PLAIN));
     /// ```
     pub fn get_parents_aliased(&self, mime_type: &Mime) -> Option<Vec<Mime>> {
-        let mut res = Vec::new();
-
-        if let Some(parents) = self.parents.lookup(&mime_type) {
-            for parent in parents {
-                res.push(parent.clone());
-            }
-        };
-
-        match res.len() {
-            0 => None,
-            _ => Some(res),
-        }
+        self.parents
+            .lookup(mime_type)
+            .filter(|&res| !res.is_empty())
+            .cloned()
     }
 
     /// Retrieves the list of matching MIME types for the given file name,
@@ -760,12 +700,9 @@ impl SharedMimeInfo {
     /// # }
     /// ```
     pub fn get_mime_types_from_file_name(&self, file_name: &str) -> Vec<Mime> {
-        match self.globs.lookup_mime_type_for_file_name(file_name) {
-            Some(v) => v,
-            None => {
-                vec![mime::APPLICATION_OCTET_STREAM.clone()]
-            }
-        }
+        self.globs
+            .lookup_mime_type_for_file_name(file_name)
+            .unwrap_or_else(|| vec![mime::APPLICATION_OCTET_STREAM])
     }
 
     /// Retrieves the MIME type for the given data, and the priority of the
@@ -886,7 +823,7 @@ impl SharedMimeInfo {
     /// // let mime_db = ...
     /// let mut gb = mime_db.guess_mime_type();
     /// let guess = gb.file_name("foo.txt").guess();
-    /// assert_eq!(guess.mime_type(), &mime::TEXT_PLAIN);
+    /// assert_eq!(*guess.mime_type(), mime::TEXT_PLAIN);
     /// assert_eq!(guess.uncertain(), false);
     /// #
     /// # Ok(())
@@ -894,7 +831,7 @@ impl SharedMimeInfo {
     /// ```
     ///
     /// [`GuessBuilder`]: struct.GuessBuilder.html
-    pub fn guess_mime_type(&self) -> GuessBuilder {
+    pub const fn guess_mime_type(&self) -> GuessBuilder<'_> {
         GuessBuilder {
             db: self,
             file_name: None,
@@ -913,16 +850,14 @@ mod tests {
     use std::str::FromStr;
 
     fn load_test_data() -> SharedMimeInfo {
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let dir = PathBuf::from(&format!("{}/test_files", cwd));
-        SharedMimeInfo::new_for_directory(dir)
+        SharedMimeInfo::new_for_directory("test_files")
     }
 
     #[test]
     fn load_from_directory() {
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let dir = PathBuf::from(&format!("{}/test_files", cwd));
-        SharedMimeInfo::new_for_directory(dir);
+        let mut cwd = env::current_dir().unwrap();
+        cwd.push("test_files");
+        SharedMimeInfo::new_for_directory(cwd);
     }
 
     #[test]
@@ -932,16 +867,16 @@ mod tests {
 
     #[test]
     fn load_default() {
-        let _db: SharedMimeInfo = Default::default();
+        let _db = SharedMimeInfo::default();
     }
 
     #[test]
     fn reload() {
         // We don't load the system data in the, admittedly, remote case the system
         // is getting updated *while* we run the test suite.
-        let mut _db = load_test_data();
+        let mut db = load_test_data();
 
-        assert_eq!(_db.reload(), false);
+        assert!(!db.reload());
     }
 
     #[test]
@@ -963,11 +898,11 @@ mod tests {
         let mime_db = load_test_data();
 
         assert_eq!(
-            mime_db.unalias_mime_type(&Mime::from_str("application/ics").unwrap()),
+            mime_db.unalias_mime_type(&"application/ics".parse().unwrap()),
             Some(Mime::from_str("text/calendar").unwrap())
         );
         assert_eq!(
-            mime_db.unalias_mime_type(&Mime::from_str("text/plain").unwrap()),
+            mime_db.unalias_mime_type(&"text/plain".parse().unwrap()),
             None
         );
     }
@@ -976,47 +911,28 @@ mod tests {
     fn mime_type_equal() {
         let mime_db = load_test_data();
 
-        assert_eq!(
-            mime_db.mime_type_equal(
-                &Mime::from_str("application/wordperfect").unwrap(),
-                &Mime::from_str("application/vnd.wordperfect").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_equal(
-                &Mime::from_str("application/x-gnome-app-info").unwrap(),
-                &Mime::from_str("application/x-desktop").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_equal(
-                &Mime::from_str("application/x-wordperfect").unwrap(),
-                &Mime::from_str("application/vnd.wordperfect").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_equal(
-                &Mime::from_str("application/x-wordperfect").unwrap(),
-                &Mime::from_str("audio/x-midi").unwrap(),
-            ),
-            false
-        );
-        assert_eq!(
-            mime_db.mime_type_equal(
-                &Mime::from_str("application/octet-stream").unwrap(),
-                &Mime::from_str("text/plain").unwrap(),
-            ),
-            false
-        );
-        assert_eq!(
-            mime_db.mime_type_equal(
-                &Mime::from_str("text/plain").unwrap(),
-                &Mime::from_str("text/*").unwrap(),
-            ),
-            false
+        assert!(mime_db.mime_type_equal(
+            &"application/wordperfect".parse().unwrap(),
+            &"application/vnd.wordperfect".parse().unwrap(),
+        ));
+        assert!(mime_db.mime_type_equal(
+            &"application/x-gnome-app-info".parse().unwrap(),
+            &"application/x-desktop".parse().unwrap(),
+        ));
+        assert!(mime_db.mime_type_equal(
+            &"application/x-wordperfect".parse().unwrap(),
+            &"application/vnd.wordperfect".parse().unwrap(),
+        ));
+        assert!(!mime_db.mime_type_equal(
+            &"application/x-wordperfect".parse().unwrap(),
+            &"audio/x-midi".parse().unwrap(),
+        ));
+        assert!(!mime_db.mime_type_equal(
+            &"application/octet-stream".parse().unwrap(),
+            &"text/plain".parse().unwrap(),
+        ));
+        assert!(
+            !mime_db.mime_type_equal(&"text/plain".parse().unwrap(), &"text/*".parse().unwrap(),)
         );
     }
 
@@ -1061,97 +977,55 @@ mod tests {
     fn mime_type_subclass() {
         let mime_db = load_test_data();
 
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("application/rtf").unwrap(),
-                &Mime::from_str("text/plain").unwrap(),
-            ),
-            true
+        assert!(mime_db.mime_type_subclass(
+            &"application/rtf".parse().unwrap(),
+            &"text/plain".parse().unwrap(),
+        ));
+        assert!(mime_db.mime_type_subclass(
+            &"message/news".parse().unwrap(),
+            &"text/plain".parse().unwrap(),
+        ));
+        assert!(mime_db.mime_type_subclass(
+            &"message/news".parse().unwrap(),
+            &"message/*".parse().unwrap(),
+        ));
+        assert!(mime_db
+            .mime_type_subclass(&"message/news".parse().unwrap(), &"text/*".parse().unwrap(),));
+        assert!(mime_db.mime_type_subclass(
+            &"message/news".parse().unwrap(),
+            &"application/octet-stream".parse().unwrap(),
+        ));
+        assert!(mime_db.mime_type_subclass(
+            &"application/rtf".parse().unwrap(),
+            &"application/octet-stream".parse().unwrap(),
+        ));
+        assert!(mime_db.mime_type_subclass(
+            &"application/x-gnome-app-info".parse().unwrap(),
+            &"text/plain".parse().unwrap(),
+        ));
+        assert!(mime_db.mime_type_subclass(
+            &"image/x-djvu".parse().unwrap(),
+            &"image/vnd.djvu".parse().unwrap(),
+        ));
+        assert!(mime_db.mime_type_subclass(
+            &"image/vnd.djvu".parse().unwrap(),
+            &"image/x-djvu".parse().unwrap(),
+        ));
+        assert!(!mime_db.mime_type_subclass(
+            &"image/vnd.djvu".parse().unwrap(),
+            &"text/plain".parse().unwrap(),
+        ));
+        assert!(!mime_db.mime_type_subclass(
+            &"image/vnd.djvu".parse().unwrap(),
+            &"text/*".parse().unwrap(),
+        ));
+        assert!(
+            mime_db.mime_type_subclass(&"text/*".parse().unwrap(), &"text/plain".parse().unwrap())
         );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("message/news").unwrap(),
-                &Mime::from_str("text/plain").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("message/news").unwrap(),
-                &Mime::from_str("message/*").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("message/news").unwrap(),
-                &Mime::from_str("text/*").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("message/news").unwrap(),
-                &Mime::from_str("application/octet-stream").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("application/rtf").unwrap(),
-                &Mime::from_str("application/octet-stream").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("application/x-gnome-app-info").unwrap(),
-                &Mime::from_str("text/plain").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("image/x-djvu").unwrap(),
-                &Mime::from_str("image/vnd.djvu").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("image/vnd.djvu").unwrap(),
-                &Mime::from_str("image/x-djvu").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("image/vnd.djvu").unwrap(),
-                &Mime::from_str("text/plain").unwrap(),
-            ),
-            false
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("image/vnd.djvu").unwrap(),
-                &Mime::from_str("text/*").unwrap(),
-            ),
-            false
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("text/*").unwrap(),
-                &Mime::from_str("text/plain").unwrap(),
-            ),
-            true
-        );
-        assert_eq!(
-            mime_db.mime_type_subclass(
-                &Mime::from_str("application/x-shellscript").unwrap(),
-                &mime::APPLICATION_OCTET_STREAM
-            ),
-            true
-        );
+        assert!(mime_db.mime_type_subclass(
+            &"application/x-shellscript".parse().unwrap(),
+            &mime::APPLICATION_OCTET_STREAM
+        ));
     }
 
     #[test]
@@ -1160,8 +1034,8 @@ mod tests {
 
         let mut gb = mime_db.guess_mime_type();
         let guess = gb.guess();
-        assert_eq!(guess.mime_type(), &mime::APPLICATION_OCTET_STREAM);
-        assert_eq!(guess.uncertain(), true);
+        assert_eq!(*guess.mime_type(), mime::APPLICATION_OCTET_STREAM);
+        assert!(guess.uncertain());
     }
 
     #[test]
@@ -1169,8 +1043,8 @@ mod tests {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
         let guess = gb.file_name("foo.txt").guess();
-        assert_eq!(guess.mime_type(), &mime::TEXT_PLAIN);
-        assert_eq!(guess.uncertain(), false);
+        assert_eq!(*guess.mime_type(), mime::TEXT_PLAIN);
+        assert!(!guess.uncertain());
     }
 
     #[test]
@@ -1179,8 +1053,8 @@ mod tests {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
         let guess = gb.data(svg_data).guess();
-        assert_eq!(guess.mime_type(), &Mime::from_str("image/svg+xml").unwrap());
-        assert_eq!(guess.uncertain(), false);
+        assert_eq!(*guess.mime_type(), "image/svg+xml");
+        assert!(!guess.uncertain());
     }
 
     #[test]
@@ -1189,8 +1063,8 @@ mod tests {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
         let guess = gb.file_name("rust-logo.png").data(png_data).guess();
-        assert_eq!(guess.mime_type(), &Mime::from_str("image/png").unwrap());
-        assert_eq!(guess.uncertain(), false);
+        assert_eq!(*guess.mime_type(), "image/png");
+        assert!(!guess.uncertain());
     }
 
     #[test]
@@ -1199,10 +1073,7 @@ mod tests {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
         let guess = gb.data(sh_data).guess();
-        assert_eq!(
-            guess.mime_type(),
-            &Mime::from_str("application/x-shellscript").unwrap()
-        );
+        assert_eq!(*guess.mime_type(), "application/x-shellscript");
     }
 
     #[test]
@@ -1211,73 +1082,49 @@ mod tests {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
         let guess = gb.file_name("gp").data(sh_data).guess();
-        assert_eq!(
-            guess.mime_type(),
-            &Mime::from_str("application/x-shellscript").unwrap()
-        );
+        assert_eq!(*guess.mime_type(), "application/x-shellscript");
     }
 
     #[test]
     fn guess_empty() {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let file = PathBuf::from(&format!("{}/test_files/files/empty", cwd));
-        let guess = gb.path(file).guess();
-        assert_ne!(guess.mime_type(), &mime::TEXT_PLAIN);
-        assert_eq!(
-            guess.mime_type(),
-            &Mime::from_str("application/x-zerosize").unwrap()
-        );
+        let guess = gb.path("test_files/files/empty").guess();
+        assert_ne!(*guess.mime_type(), mime::TEXT_PLAIN);
+        assert_eq!(*guess.mime_type(), "application/x-zerosize");
     }
 
     #[test]
     fn guess_empty_no_zero_size() {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let file = PathBuf::from(&format!("{}/test_files/files/empty.json", cwd));
-        let guess = gb.path(file.clone()).guess();
-        assert_ne!(guess.mime_type(), &mime::APPLICATION_JSON);
-        assert_eq!(
-            guess.mime_type(),
-            &Mime::from_str("application/x-zerosize").unwrap()
-        );
+        let file = "test_files/files/empty.json";
+        let guess = gb.path(file).guess();
+        assert_ne!(*guess.mime_type(), mime::APPLICATION_JSON);
+        assert_eq!(*guess.mime_type(), "application/x-zerosize");
         let guess = gb.path(file).zero_size(false).guess();
-        assert_ne!(
-            guess.mime_type(),
-            &Mime::from_str("application/x-zerosize").unwrap()
-        );
-        assert_eq!(guess.mime_type(), &mime::APPLICATION_JSON);
+        assert_ne!(*guess.mime_type(), "application/x-zerosize");
+        assert_eq!(*guess.mime_type(), mime::APPLICATION_JSON);
     }
 
     #[test]
     fn guess_empty_no_zero_size_no_extension() {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let file = PathBuf::from(&format!("{}/test_files/files/empty", cwd));
-        let guess = gb.path(file.clone()).guess();
-        assert_eq!(
-            guess.mime_type(),
-            &Mime::from_str("application/x-zerosize").unwrap()
-        );
+        let file = "test_files/files/empty";
+        let guess = gb.path(file).guess();
+        assert_eq!(*guess.mime_type(), "application/x-zerosize");
         let guess = gb.path(file).zero_size(false).guess();
         // Return `application/x-zerosize` even if `zero_size` is false
-        assert_eq!(
-            guess.mime_type(),
-            &Mime::from_str("application/x-zerosize").unwrap()
-        );
+        assert_eq!(*guess.mime_type(), "application/x-zerosize");
     }
 
     #[test]
     fn guess_text() {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let file = PathBuf::from(&format!("{}/test_files/files/text", cwd));
-        let guess = gb.path(file).guess();
-        assert_eq!(guess.mime_type(), &mime::TEXT_PLAIN);
+        let guess = gb.path("test_files/files/text").guess();
+        assert_eq!(*guess.mime_type(), mime::TEXT_PLAIN);
     }
 
     #[test]
@@ -1290,10 +1137,8 @@ mod tests {
 
     #[test]
     fn guess_turtle() {
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let ttl_file = PathBuf::from(&format!("{}/test_files/files/example.ttl", cwd));
         let ttl_data = include_bytes!("../test_files/files/example.ttl");
-        let ttl_meta = std::fs::metadata(ttl_file).unwrap();
+        let ttl_meta = std::fs::metadata("test_files/files/example.ttl").unwrap();
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
         let guess = gb
@@ -1301,15 +1146,13 @@ mod tests {
             .metadata(ttl_meta)
             .data(ttl_data)
             .guess();
-        assert_eq!(guess.mime_type(), &Mime::from_str("text/turtle").unwrap());
+        assert_eq!(*guess.mime_type(), "text/turtle");
     }
 
     #[test]
     fn guess_dodgy_desktop_file() {
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let desktop_file = PathBuf::from(&format!("{}/test_files/files/launcher", cwd));
         let desktop_data = include_bytes!("../test_files/files/launcher");
-        let desktop_meta = std::fs::metadata(desktop_file).unwrap();
+        let desktop_meta = std::fs::metadata("test_files/files/launcher").unwrap();
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
         let guess = gb
@@ -1317,16 +1160,14 @@ mod tests {
             .metadata(desktop_meta)
             .data(desktop_data)
             .guess();
-        assert_eq!(guess.mime_type(), &Mime::from_str("text/plain").unwrap());
+        assert_eq!(*guess.mime_type(), "text/plain");
     }
 
     #[test]
     fn guess_html_with_no_html_tags() {
         let mime_db = load_test_data();
         let mut gb = mime_db.guess_mime_type();
-        let cwd = env::current_dir().unwrap().to_string_lossy().into_owned();
-        let file = PathBuf::from(&format!("{}/test_files/files/no_html_tags.html", cwd));
-        let guess = gb.path(file).guess();
-        assert_eq!(guess.mime_type(), &mime::TEXT_HTML);
+        let guess = gb.path("test_files/files/no_html_tags.html").guess();
+        assert_eq!(*guess.mime_type(), mime::TEXT_HTML);
     }
 }

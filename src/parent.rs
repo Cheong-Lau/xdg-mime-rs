@@ -3,12 +3,12 @@ use std::fmt;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use mime::Mime;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Subclass {
     mime_type: Mime,
     parent_type: Mime,
@@ -23,7 +23,7 @@ impl Subclass {
     }
 
     fn from_string(s: &str) -> Option<Subclass> {
-        let mut chunks = s.split_whitespace().fuse();
+        let mut chunks = s.split_whitespace();
         let mime_type = chunks.next().and_then(|s| Mime::from_str(s).ok())?;
         let parent_type = chunks.next().and_then(|s| Mime::from_str(s).ok())?;
 
@@ -45,28 +45,24 @@ impl fmt::Debug for Subclass {
     }
 }
 
+#[derive(Default)]
 pub struct ParentsMap {
     parents: HashMap<Mime, Vec<Mime>>,
 }
 
 impl ParentsMap {
     pub fn new() -> ParentsMap {
-        ParentsMap {
-            parents: HashMap::new(),
-        }
+        ParentsMap::default()
     }
 
     fn add_subclass(&mut self, subclass: Subclass) {
-        let v = self
-            .parents
-            .entry(subclass.mime_type.clone())
-            .or_default();
+        let v = self.parents.entry(subclass.mime_type).or_default();
         if !v.contains(&subclass.parent_type) {
             v.push(subclass.parent_type);
         }
     }
 
-    pub fn add_subclasses(&mut self, subclasses: Vec<Subclass>) {
+    pub fn add_subclasses(&mut self, subclasses: impl IntoIterator<Item = Subclass>) {
         for s in subclasses {
             self.add_subclass(s);
         }
@@ -82,9 +78,8 @@ impl ParentsMap {
 }
 
 pub fn read_subclasses_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Subclass> {
-    let f = match File::open(file_name) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
+    let Ok(f) = File::open(file_name) else {
+        return Vec::new();
     };
 
     let mut res = Vec::new();
@@ -100,9 +95,8 @@ pub fn read_subclasses_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Subclass> 
             continue;
         }
 
-        match Subclass::from_string(&line) {
-            Some(v) => res.push(v),
-            None => continue,
+        if let Some(subclass) = Subclass::from_string(&line) {
+            res.push(subclass);
         }
     }
 
@@ -110,9 +104,7 @@ pub fn read_subclasses_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Subclass> 
 }
 
 pub fn read_subclasses_from_dir<P: AsRef<Path>>(dir: P) -> Vec<Subclass> {
-    let mut subclasses_file = PathBuf::new();
-    subclasses_file.push(dir);
-    subclasses_file.push("subclasses");
+    let subclasses_file = dir.as_ref().join("subclasses");
 
     read_subclasses_from_file(subclasses_file)
 }
@@ -126,8 +118,8 @@ mod tests {
         assert_eq!(
             Subclass::from_string("message/partial text/plain").unwrap(),
             Subclass::new(
-                &Mime::from_str("message/partial").unwrap(),
-                &Mime::from_str("text/plain").unwrap()
+                &"message/partial".parse().unwrap(),
+                &"text/plain".parse().unwrap()
             )
         );
     }
@@ -137,16 +129,16 @@ mod tests {
         let mut pm = ParentsMap::new();
 
         pm.add_subclass(Subclass::new(
-            &Mime::from_str("message/partial").unwrap(),
-            &Mime::from_str("text/plain").unwrap(),
+            &"message/partial".parse().unwrap(),
+            &"text/plain".parse().unwrap(),
         ));
         pm.add_subclass(Subclass::new(
-            &Mime::from_str("text/rfc822-headers").unwrap(),
-            &Mime::from_str("text/plain").unwrap(),
+            &"text/rfc822-headers".parse().unwrap(),
+            &"text/plain".parse().unwrap(),
         ));
 
         assert_eq!(
-            pm.lookup(&Mime::from_str("message/partial").unwrap()),
+            pm.lookup(&"message/partial".parse().unwrap()),
             Some(&vec![Mime::from_str("text/plain").unwrap()]),
         );
     }

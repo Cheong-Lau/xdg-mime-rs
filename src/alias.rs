@@ -2,12 +2,12 @@ use std::fmt;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use mime::Mime;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Alias {
     pub alias: Mime,
     pub mime_type: Mime,
@@ -16,6 +16,18 @@ pub struct Alias {
 impl fmt::Debug for Alias {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "Alias {} {}", self.alias, self.mime_type)
+    }
+}
+
+impl std::cmp::PartialOrd for Alias {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for Alias {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.alias.cmp(&other.alias)
     }
 }
 
@@ -28,7 +40,7 @@ impl Alias {
     }
 
     pub fn from_string(s: &str) -> Option<Alias> {
-        let mut chunks = s.split_whitespace().fuse();
+        let mut chunks = s.split_whitespace();
         let alias = chunks.next().and_then(|s| Mime::from_str(s).ok())?;
         let mime_type = chunks.next().and_then(|s| Mime::from_str(s).ok())?;
 
@@ -45,30 +57,29 @@ impl Alias {
     }
 }
 
+#[derive(Default)]
 pub struct AliasesList {
     aliases: Vec<Alias>,
 }
 
 impl AliasesList {
     pub fn new() -> AliasesList {
-        AliasesList {
-            aliases: Vec::new(),
-        }
+        AliasesList::default()
     }
 
-    pub fn add_aliases(&mut self, aliases: Vec<Alias>) {
+    pub fn add_aliases(&mut self, aliases: impl IntoIterator<Item = Alias>) {
         self.aliases.extend(aliases);
         self.sort();
     }
 
     pub fn sort(&mut self) {
-        self.aliases.sort_by(|a, b| a.alias.cmp(&b.alias))
+        self.aliases.sort();
     }
 
     pub fn unalias_mime_type(&self, mime_type: &Mime) -> Option<Mime> {
         self.aliases
             .iter()
-            .find(|a| a.alias == *mime_type)
+            .find(|&a| a.alias == *mime_type)
             .map(|a| a.mime_type.clone())
     }
 
@@ -80,9 +91,8 @@ impl AliasesList {
 pub fn read_aliases_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Alias> {
     let mut res = Vec::new();
 
-    let f = match File::open(file_name) {
-        Ok(v) => v,
-        Err(_) => return res,
+    let Ok(f) = File::open(file_name) else {
+        return res;
     };
 
     let file = BufReader::new(&f);
@@ -97,9 +107,8 @@ pub fn read_aliases_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Alias> {
             continue;
         }
 
-        match Alias::from_string(&line) {
-            Some(v) => res.push(v),
-            None => continue,
+        if let Some(alias) = Alias::from_string(&line) {
+            res.push(alias);
         }
     }
 
@@ -107,9 +116,7 @@ pub fn read_aliases_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Alias> {
 }
 
 pub fn read_aliases_from_dir<P: AsRef<Path>>(dir: P) -> Vec<Alias> {
-    let mut alias_file = PathBuf::new();
-    alias_file.push(dir);
-    alias_file.push("aliases");
+    let alias_file = dir.as_ref().join("aliases");
 
     read_aliases_from_file(alias_file)
 }
@@ -121,12 +128,12 @@ mod tests {
     #[test]
     fn new_alias() {
         assert!(Alias::new(
-            &Mime::from_str("application/foo").unwrap(),
-            &Mime::from_str("application/foo").unwrap()
+            &"application/foo".parse().unwrap(),
+            &"application/foo".parse().unwrap()
         )
         .is_equivalent(&Alias::new(
-            &Mime::from_str("application/foo").unwrap(),
-            &Mime::from_str("application/x-foo").unwrap()
+            &"application/foo".parse().unwrap(),
+            &"application/x-foo".parse().unwrap()
         )),);
     }
 
@@ -135,8 +142,8 @@ mod tests {
         assert_eq!(
             Alias::from_string("application/x-foo application/foo").unwrap(),
             Alias::new(
-                &Mime::from_str("application/x-foo").unwrap(),
-                &Mime::from_str("application/foo").unwrap(),
+                &"application/x-foo".parse().unwrap(),
+                &"application/foo".parse().unwrap(),
             )
         );
     }
