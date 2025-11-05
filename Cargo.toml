@@ -10,13 +10,13 @@ readme = "README.md"
 keywords = ["linux", "mime", "xdg", "configuration"]
 license = "Apache-2.0"
 exclude = [".github/*", ".gitignore"]
+rust-version = "1.65"
 
 [lib]
 name = "xdg_mime"
 path = "src/lib.rs"
 
 [dependencies]
-dirs-next = "2.0"
 glob = "0.3.0"
 mime = "0.3"
 nom = "^7"
