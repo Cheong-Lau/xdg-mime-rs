@@ -19,7 +19,7 @@ path = "src/lib.rs"
 [dependencies]
 glob = "0.3.0"
 mime = "0.3"
-nom = "^7"
+nom = "^8"
 unicase = "2.3.0"
 
 [package.metadata.docs.rs]

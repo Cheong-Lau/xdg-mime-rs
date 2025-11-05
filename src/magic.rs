@@ -1,27 +1,19 @@
 use nom::branch::alt;
-use nom::bytes::complete::{is_a, tag, take, take_until, take_while};
+use nom::bytes::complete::{is_a, tag, take, take_until};
 use nom::character::complete::{char, line_ending};
-use nom::character::is_hex_digit;
-use nom::combinator::{map_res, opt, peek};
+use nom::combinator::{into, opt};
 use nom::multi::{many0, many1};
-use nom::number::complete::be_u16;
-use nom::sequence::tuple;
+use nom::number::complete::{be_u16, hex_u32};
+use nom::sequence::{delimited, preceded, separated_pair, terminated};
 use nom::IResult;
+use nom::{ParseTo as _, Parser as _};
 use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
-use std::str::{self, FromStr};
 use std::vec::Vec;
 
 use mime::Mime;
-
-pub fn buf_to_u32(s: &[u8], or_default: u32) -> u32 {
-    str::from_utf8(s)
-        .ok()
-        .and_then(|t| t.parse().ok())
-        .unwrap_or(or_default)
-}
 
 #[derive(Clone, Debug, PartialEq)]
 struct MagicRule {
@@ -72,43 +64,30 @@ impl MagicRule {
 
 // Indentation level, can be 0
 fn indent_level(bytes: &[u8]) -> IResult<&[u8], u32> {
-    let (bytes, res) = take_until(">")(bytes)?;
-
-    Ok((bytes, buf_to_u32(res, 0)))
+    is_a("0123456789>")
+        .and_then(take_until(">"))
+        .map(|s: &[u8]| s.parse_to().unwrap_or(0))
+        .parse(bytes)
 }
 
 // Offset, can be 0
 fn start_offset(bytes: &[u8]) -> IResult<&[u8], u32> {
-    let (bytes, res) = take_until("=")(bytes)?;
-
-    Ok((bytes, buf_to_u32(res, 0)))
+    take_until("=")
+        .map(|s: &[u8]| s.parse_to().unwrap_or(0))
+        .parse(bytes)
 }
 
 // <word_size> = '~' (0 | 1 | 2 | 4)
 fn word_size(bytes: &[u8]) -> IResult<&[u8], Option<u32>> {
-    let alt_size = alt((tag("0"), tag("1"), tag("2"), tag("4")));
-    let word_size = tuple((tag("~"), alt_size));
-    let (bytes, res) = opt(word_size)(bytes)?;
+    let alt_size = alt([char('0'), char('1'), char('2'), char('4')]).map_opt(|n| n.to_digit(10));
+    let word_size = preceded(char('~'), alt_size);
 
-    let size = match res {
-        Some(v) => buf_to_u32(v.1, 1),
-        None => return Ok((bytes, None)),
-    };
-
-    Ok((bytes, Some(size)))
+    opt(word_size).parse(bytes)
 }
 
 // <range_length> = '+' <u32>
 fn range_length(bytes: &[u8]) -> IResult<&[u8], Option<u32>> {
-    let range_len = tuple((tag("+"), take_while(is_hex_digit)));
-    let (bytes, res) = opt(range_len)(bytes)?;
-
-    let len = match res {
-        Some(v) => buf_to_u32(v.1, 1),
-        None => return Ok((bytes, None)),
-    };
-
-    Ok((bytes, Some(len)))
+    opt(preceded(char('+'), hex_u32)).parse(bytes)
 }
 
 // magic_rule =
@@ -117,49 +96,32 @@ fn range_length(bytes: &[u8]) -> IResult<&[u8], Option<u32>> {
 // '\n'
 
 fn value(bytes: &[u8], length: u16) -> IResult<&[u8], Box<[u8]>> {
-    let (bytes, res) = take(length)(bytes)?;
-
-    Ok((bytes, res.into()))
+    take(length).map(Box::from).parse(bytes)
 }
 
 fn mask(bytes: &[u8], length: u16) -> IResult<&[u8], Option<Box<[u8]>>> {
-    let (bytes, res) = opt(tuple((char('&'), take(length))))(bytes)?;
-
-    let value = match res {
-        Some(v) => v.1.into(),
-        None => return Ok((bytes, None)),
-    };
-
-    Ok((bytes, Some(value)))
+    opt(preceded(char('&'), into(take(length)))).parse(bytes)
 }
 
 fn magic_rule(bytes: &[u8]) -> IResult<&[u8], MagicRule> {
-    let (bytes, _) = peek(is_a("0123456789>"))(bytes)?;
+    let (bytes, (indent, start_offset, value_length)) =
+        (indent_level, start_offset, preceded(char('='), be_u16)).parse(bytes)?;
 
-    let (bytes, _indent) = indent_level(bytes)?;
+    let (bytes, value) = value(bytes, value_length)?;
+    let (bytes, mask) = mask(bytes, value_length)?;
 
-    let (bytes, _) = tag(">")(bytes)?;
-    let (bytes, _start_offset) = start_offset(bytes)?;
-
-    let (bytes, _) = tag("=")(bytes)?;
-    let (bytes, _value_length) = be_u16(bytes)?;
-    let (bytes, _value) = value(bytes, _value_length)?;
-    let (bytes, _mask) = mask(bytes, _value_length)?;
-
-    let (bytes, _word_size) = word_size(bytes)?;
-    let (bytes, _range_length) = range_length(bytes)?;
-
-    let (bytes, _) = line_ending(bytes)?;
+    let (bytes, (word_size, range_length)) =
+        terminated((word_size, range_length), line_ending).parse(bytes)?;
 
     Ok((
         bytes,
         MagicRule {
-            indent: _indent,
-            start_offset: _start_offset,
-            value: _value,
-            mask: _mask,
-            word_size: _word_size.unwrap_or(1),
-            range_length: _range_length.unwrap_or(1),
+            indent,
+            start_offset,
+            value,
+            mask,
+            word_size: word_size.unwrap_or(1),
+            range_length: range_length.unwrap_or(1),
         },
     ))
 }
@@ -221,44 +183,43 @@ impl MagicEntry {
 }
 
 fn priority(bytes: &[u8]) -> IResult<&[u8], u32> {
-    let (bytes, res) = take_until(":")(bytes)?;
-
-    Ok((bytes, buf_to_u32(res, 0)))
+    take_until(":")
+        .map(|s: &[u8]| s.parse_to().unwrap_or(0))
+        .parse(bytes)
 }
 
 fn mime_type(bytes: &[u8]) -> IResult<&[u8], Mime> {
-    map_res(map_res(take_until("]\n"), str::from_utf8), Mime::from_str)(bytes)
+    take_until("]\n")
+        .map_opt(|s: &[u8]| s.parse_to())
+        .parse(bytes)
 }
 
 // magic_header =
 // '[' <priority> ':' <mime_type> ']' '\n'
 fn magic_header(bytes: &[u8]) -> IResult<&[u8], (u32, Mime)> {
-    let (bytes, (_, _priority, _, _mime_type, _)) =
-        tuple((tag("["), priority, tag(":"), mime_type, tag("]\n")))(bytes)?;
-
-    Ok((bytes, (_priority, _mime_type)))
+    delimited(
+        char('['),
+        separated_pair(priority, char(':'), mime_type),
+        tag("]\n"),
+    )
+    .parse(bytes)
 }
 
 // magic_entry =
 // <magic_header>
 // <magic_rule>+
 fn magic_entry(bytes: &[u8]) -> IResult<&[u8], MagicEntry> {
-    let (bytes, (_header, _rules)) = tuple((magic_header, many1(magic_rule)))(bytes)?;
-
-    Ok((
-        bytes,
-        MagicEntry {
-            priority: _header.0,
-            mime_type: _header.1,
-            rules: _rules.into_boxed_slice(),
-        },
-    ))
+    (magic_header, many1(magic_rule))
+        .map(|(header, rules)| MagicEntry {
+            priority: header.0,
+            mime_type: header.1,
+            rules: rules.into_boxed_slice(),
+        })
+        .parse(bytes)
 }
 
 fn from_u8_to_entries(bytes: &[u8]) -> IResult<&[u8], Vec<MagicEntry>> {
-    let (bytes, (_, entries)) = tuple((tag("MIME-Magic\0\n"), many0(magic_entry)))(bytes)?;
-
-    Ok((bytes, entries))
+    preceded(tag("MIME-Magic\0\n"), many0(magic_entry)).parse(bytes)
 }
 
 pub fn lookup_data(entries: &[MagicEntry], data: &[u8]) -> Option<(Mime, u32)> {
@@ -308,8 +269,8 @@ mod tests {
                 assert_eq!(i.len(), 0);
                 println!("parsed:\n{o:?}");
             }
-            e => {
-                println!("invalid or incomplete: {e:?}");
+            Err(e) => {
+                println!("invalid or incomplete: {e}");
                 panic!("cannot parse magic rule");
             }
         }
@@ -326,8 +287,8 @@ mod tests {
                 println!("remaining:\n{}", &i.to_hex_from(8, simple.offset(i)));
                 println!("parsed:\n{o:?}");
             }
-            e => {
-                println!("invalid or incomplete: {e:?}");
+            Err(e) => {
+                println!("invalid or incomplete: {e}");
                 panic!("cannot parse magic rule");
             }
         }
@@ -341,8 +302,8 @@ mod tests {
                 println!("remaining:\n{}", &i.to_hex_from(8, range.offset(i)));
                 println!("parsed:\n{o:?}");
             }
-            e => {
-                println!("invalid or incomplete: {e:?}");
+            Err(e) => {
+                println!("invalid or incomplete: {e}");
                 panic!("cannot parse magic rule");
             }
         }
@@ -356,8 +317,8 @@ mod tests {
                 println!("remaining:\n{}", &i.to_hex_from(8, ws.offset(i)));
                 println!("parsed:\n{o:?}");
             }
-            e => {
-                println!("invalid or incomplete: {e:?}");
+            Err(e) => {
+                println!("invalid or incomplete: {e}");
                 panic!("cannot parse magic rule");
             }
         }
@@ -374,8 +335,8 @@ mod tests {
                 println!("remaining:\n{}", &i.to_hex_from(8, data.offset(i)));
                 println!("parsed:\n{o:?}");
             }
-            e => {
-                println!("invalid or incomplete: {e:?}");
+            Err(e) => {
+                println!("invalid or incomplete: {e}");
                 panic!("cannot parse magic entry");
             }
         }
@@ -392,8 +353,8 @@ mod tests {
                 println!("remaining:\n{}", &i.to_hex_from(8, data.offset(i)));
                 println!("parsed:\n{o:?}");
             }
-            e => {
-                println!("invalid or incomplete: {e:?}");
+            Err(e) => {
+                println!("invalid or incomplete: {e}");
                 panic!("cannot parse magic entry");
             }
         }
@@ -409,8 +370,8 @@ mod tests {
                 println!("remaining:\n{}", &i.to_hex_from(8, data.offset(i)));
                 println!("parsed {} magic entries:\n{:#?}", o.len(), o);
             }
-            e => {
-                println!("invalid or incomplete: {e:?}");
+            Err(e) => {
+                println!("invalid or incomplete: {e}");
                 panic!("cannot parse magic file");
             }
         }
