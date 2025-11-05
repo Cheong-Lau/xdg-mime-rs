@@ -1,5 +1,5 @@
+use rustc_hash::FxHashSet;
 use std::cmp::Reverse;
-use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -240,7 +240,7 @@ pub fn read_globs_from_dir<P: AsRef<Path>>(dir: P) -> Vec<Glob> {
 
 #[derive(Default)]
 pub struct GlobMap {
-    globs: HashSet<Glob>,
+    globs: FxHashSet<Glob>,
 }
 
 impl GlobMap {

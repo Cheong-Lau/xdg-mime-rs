@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::BufRead;
@@ -47,7 +47,7 @@ impl fmt::Debug for Subclass {
 
 #[derive(Default)]
 pub struct ParentsMap {
-    parents: HashMap<Mime, Vec<Mime>>,
+    parents: FxHashMap<Mime, Vec<Mime>>,
 }
 
 impl ParentsMap {
