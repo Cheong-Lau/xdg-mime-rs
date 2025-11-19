@@ -1,10 +1,8 @@
 use rustc_hash::FxHashSet;
 use std::cmp::Reverse;
 use std::fmt;
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::BufRead;
-use std::io::BufReader;
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -176,68 +174,6 @@ impl Glob {
     }
 }
 
-pub fn read_globs_v1_from_file<P: AsRef<Path>>(file_name: P) -> Option<Vec<Glob>> {
-    let Ok(f) = File::open(file_name) else {
-        return None;
-    };
-
-    let mut res = Vec::new();
-    let file = BufReader::new(&f);
-    for line in file.lines() {
-        if line.is_err() {
-            return None;
-        }
-
-        let line = line.unwrap();
-
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(glob) = Glob::from_v1_string(&line) {
-            res.push(glob);
-        }
-    }
-
-    Some(res)
-}
-
-pub fn read_globs_v2_from_file<P: AsRef<Path>>(file_name: P) -> Option<Vec<Glob>> {
-    let Ok(f) = File::open(file_name) else {
-        return None;
-    };
-
-    let mut res = Vec::new();
-    let file = BufReader::new(&f);
-    for line in file.lines() {
-        if line.is_err() {
-            return None;
-        }
-
-        let line = line.unwrap();
-
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(glob) = Glob::from_v2_string(&line) {
-            res.push(glob);
-        }
-    }
-
-    Some(res)
-}
-
-pub fn read_globs_from_dir<P: AsRef<Path>>(dir: P) -> Vec<Glob> {
-    let mut globs_file = dir.as_ref().join("globs2");
-
-    read_globs_v2_from_file(&globs_file).unwrap_or_else(|| {
-        globs_file.pop();
-        globs_file.push("globs");
-        read_globs_v1_from_file(globs_file).unwrap_or_default()
-    })
-}
-
 #[derive(Default)]
 pub struct GlobMap {
     globs: FxHashSet<Glob>,
@@ -252,8 +188,22 @@ impl GlobMap {
         self.globs.insert(glob);
     }
 
-    pub fn add_globs(&mut self, globs: impl IntoIterator<Item = Glob>) {
-        self.globs.extend(globs);
+    pub fn add_globs_from_dir<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<()> {
+        let mut globs_dir = dir.as_ref().join("globs2");
+
+        if let Err(e) = crate::extend_from_path(self, &globs_dir, Glob::from_v2_string) {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(e);
+            }
+
+            // Try reading from v1 file if v2 not found
+            globs_dir.pop();
+            globs_dir.push("globs");
+
+            crate::extend_from_path(&mut self.globs, &globs_dir, Glob::from_v1_string)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn lookup_mime_type_for_file_name(&self, file_name: &str) -> Option<Vec<Mime>> {
@@ -301,6 +251,12 @@ impl fmt::Debug for GlobMap {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("Globs:\n")?;
         self.globs.fmt(f)
+    }
+}
+
+impl Extend<Glob> for GlobMap {
+    fn extend<T: IntoIterator<Item = Glob>>(&mut self, iter: T) {
+        self.globs.extend(iter);
     }
 }
 

@@ -1,8 +1,6 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
-use std::fs::File;
-use std::io::BufRead;
-use std::io::BufReader;
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -47,7 +45,7 @@ impl fmt::Debug for Subclass {
 
 #[derive(Default)]
 pub struct ParentsMap {
-    parents: FxHashMap<Mime, Vec<Mime>>,
+    parents: FxHashMap<Mime, FxHashSet<Mime>>,
 }
 
 impl ParentsMap {
@@ -57,56 +55,32 @@ impl ParentsMap {
 
     fn add_subclass(&mut self, subclass: Subclass) {
         let v = self.parents.entry(subclass.mime_type).or_default();
-        if !v.contains(&subclass.parent_type) {
-            v.push(subclass.parent_type);
-        }
+        v.insert(subclass.parent_type);
     }
 
-    pub fn add_subclasses(&mut self, subclasses: impl IntoIterator<Item = Subclass>) {
-        for s in subclasses {
-            self.add_subclass(s);
-        }
-    }
-
-    pub fn lookup(&self, mime_type: &Mime) -> Option<&Vec<Mime>> {
+    pub fn lookup(&self, mime_type: &Mime) -> Option<&FxHashSet<Mime>> {
         self.parents.get(mime_type)
     }
 
     pub fn clear(&mut self) {
         self.parents.clear();
     }
+
+    pub fn add_subclasses_from_dir<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<()> {
+        let subclasses_dir = dir.as_ref().join("subclasses");
+        crate::extend_from_path(self, &subclasses_dir, Subclass::from_string)
+    }
 }
 
-pub fn read_subclasses_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Subclass> {
-    let Ok(f) = File::open(file_name) else {
-        return Vec::new();
-    };
+impl Extend<Subclass> for ParentsMap {
+    fn extend<T: IntoIterator<Item = Subclass>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        self.parents.reserve(iter.size_hint().0);
 
-    let mut res = Vec::new();
-    let file = BufReader::new(&f);
-    for line in file.lines() {
-        if line.is_err() {
-            return res; // FIXME: return error instead
-        }
-
-        let line = line.unwrap();
-
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(subclass) = Subclass::from_string(&line) {
-            res.push(subclass);
+        for subclass in iter {
+            self.add_subclass(subclass);
         }
     }
-
-    res
-}
-
-pub fn read_subclasses_from_dir<P: AsRef<Path>>(dir: P) -> Vec<Subclass> {
-    let subclasses_file = dir.as_ref().join("subclasses");
-
-    read_subclasses_from_file(subclasses_file)
 }
 
 #[cfg(test)]
@@ -139,7 +113,11 @@ mod tests {
 
         assert_eq!(
             pm.lookup(&"message/partial".parse().unwrap()),
-            Some(&vec![Mime::from_str("text/plain").unwrap()]),
+            Some(
+                &[Mime::from_str("text/plain").unwrap()]
+                    .into_iter()
+                    .collect()
+            ),
         );
     }
 

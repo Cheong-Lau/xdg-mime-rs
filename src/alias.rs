@@ -1,7 +1,5 @@
 use std::fmt;
-use std::fs::File;
-use std::io::BufRead;
-use std::io::BufReader;
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -67,11 +65,6 @@ impl AliasesList {
         AliasesList::default()
     }
 
-    pub fn add_aliases(&mut self, aliases: impl IntoIterator<Item = Alias>) {
-        self.aliases.extend(aliases);
-        self.sort();
-    }
-
     pub fn sort(&mut self) {
         self.aliases.sort();
     }
@@ -86,39 +79,18 @@ impl AliasesList {
     pub fn clear(&mut self) {
         self.aliases.clear();
     }
-}
 
-pub fn read_aliases_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Alias> {
-    let mut res = Vec::new();
-
-    let Ok(f) = File::open(file_name) else {
-        return res;
-    };
-
-    let file = BufReader::new(&f);
-    for line in file.lines() {
-        if line.is_err() {
-            return res; // FIXME: return error instead
-        }
-
-        let line = line.unwrap();
-
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(alias) = Alias::from_string(&line) {
-            res.push(alias);
-        }
+    pub fn add_aliases_from_dir<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<()> {
+        let alias_dir = dir.as_ref().join("aliases");
+        crate::extend_from_path(self, &alias_dir, Alias::from_string)
     }
-
-    res
 }
 
-pub fn read_aliases_from_dir<P: AsRef<Path>>(dir: P) -> Vec<Alias> {
-    let alias_file = dir.as_ref().join("aliases");
-
-    read_aliases_from_file(alias_file)
+impl Extend<Alias> for AliasesList {
+    fn extend<T: IntoIterator<Item = Alias>>(&mut self, iter: T) {
+        self.aliases.extend(iter);
+        self.aliases.sort();
+    }
 }
 
 #[cfg(test)]

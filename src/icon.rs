@@ -1,7 +1,5 @@
 use std::fmt;
-use std::fs::File;
-use std::io::BufRead;
-use std::io::BufReader;
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -44,42 +42,21 @@ impl Icon {
     }
 }
 
-pub fn read_icons_from_file<P: AsRef<Path>>(file_name: P) -> Vec<Icon> {
-    let Ok(f) = File::open(file_name) else {
-        return Vec::new();
-    };
-
-    let mut res = Vec::new();
-    let file = BufReader::new(&f);
-    for line in file.lines() {
-        if line.is_err() {
-            return res; // FIXME: return error instead
-        }
-
-        let line = line.unwrap();
-
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(icon) = Icon::from_string(&line) {
-            res.push(icon);
-        }
-    }
-
-    res.sort_by(|a, b| a.mime_type.cmp(&b.mime_type));
-
-    res
-}
-
-pub fn read_icons_from_dir<P: AsRef<Path>>(dir: P, generic: bool) -> Vec<Icon> {
+pub fn add_icons_from_dir<P: AsRef<Path>>(
+    dir: P,
+    generic: bool,
+    vector: &mut Vec<Icon>,
+) -> io::Result<()> {
     let icons_file = if generic {
         dir.as_ref().join("generic-icons")
     } else {
         dir.as_ref().join("icons")
     };
 
-    read_icons_from_file(icons_file)
+    crate::extend_from_path(vector, &icons_file, Icon::from_string)?;
+
+    vector.sort_by(|a, b| a.mime_type.cmp(&b.mime_type));
+    Ok(())
 }
 
 pub fn find_icon<'a>(icons: &'a [Icon], mime_type: &Mime) -> Option<&'a str> {

@@ -9,8 +9,8 @@ use nom::sequence::{delimited, preceded, separated_pair, terminated};
 use nom::IResult;
 use nom::{ParseTo as _, Parser as _};
 use std::fmt;
-use std::fs::File;
-use std::io::prelude::*;
+use std::fs::read;
+use std::io;
 use std::path::Path;
 use std::vec::Vec;
 
@@ -268,21 +268,11 @@ pub fn max_extents(entries: &[MagicEntry]) -> usize {
         .unwrap_or(0)
 }
 
-pub fn read_magic_from_file<P: AsRef<Path>>(file_name: P) -> Vec<MagicEntry> {
-    let Ok(mut f) = File::open(file_name) else {
-        return Vec::new();
-    };
-
-    let mut magic_buf = Vec::new();
-
-    f.read_to_end(&mut magic_buf).unwrap();
-    from_u8_to_entries(magic_buf.as_slice()).map_or_else(|_| Vec::new(), |v| v.1)
-}
-
-pub fn read_magic_from_dir<P: AsRef<Path>>(dir: P) -> Vec<MagicEntry> {
+pub fn read_magic_from_dir<P: AsRef<Path>>(dir: P) -> io::Result<Vec<MagicEntry>> {
     let magic_file = dir.as_ref().join("magic");
-
-    read_magic_from_file(magic_file)
+    read(magic_file).map(|magic_buf| {
+        from_u8_to_entries(magic_buf.as_slice()).map_or_else(|_| Vec::new(), |v| v.1)
+    })
 }
 
 #[cfg(test)]

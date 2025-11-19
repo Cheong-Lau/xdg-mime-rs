@@ -67,6 +67,7 @@ use mime::Mime;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -476,26 +477,17 @@ impl SharedMimeInfo {
         }
     }
 
-    fn load_directory(&mut self, mut directory: PathBuf) {
+    fn load_directory(&mut self, mut directory: PathBuf) -> io::Result<()> {
         directory.push("mime");
         let mime_path = directory.into_boxed_path();
 
-        let aliases = alias::read_aliases_from_dir(&mime_path);
-        self.aliases.add_aliases(aliases);
+        self.aliases.add_aliases_from_dir(&mime_path)?;
+        self.parents.add_subclasses_from_dir(&mime_path)?;
+        self.globs.add_globs_from_dir(&mime_path)?;
+        icon::add_icons_from_dir(&mime_path, false, &mut self.icons)?;
+        icon::add_icons_from_dir(&mime_path, true, &mut self.generic_icons)?;
 
-        let mut icons = icon::read_icons_from_dir(&mime_path, false);
-        self.icons.append(&mut icons);
-
-        let mut generic_icons = icon::read_icons_from_dir(&mime_path, true);
-        self.generic_icons.append(&mut generic_icons);
-
-        let subclasses = parent::read_subclasses_from_dir(&mime_path);
-        self.parents.add_subclasses(subclasses);
-
-        let globs = glob::read_globs_from_dir(&mime_path);
-        self.globs.add_globs(globs);
-
-        let mut magic_entries = magic::read_magic_from_dir(&mime_path);
+        let mut magic_entries = magic::read_magic_from_dir(&mime_path)?;
         self.magic.append(&mut magic_entries);
 
         let mtime = fs::metadata(&mime_path)
@@ -506,6 +498,8 @@ impl SharedMimeInfo {
             path: mime_path,
             mtime,
         });
+
+        Ok(())
     }
 
     /// Creates a new `SharedMimeInfo` instance containing all MIME information
@@ -533,8 +527,7 @@ impl SharedMimeInfo {
         let mut loaded_data_dirs = false;
         if let Some(paths) = env::var_os("XDG_DATA_DIRS") {
             for path in env::split_paths(&paths).filter(|p| p.is_absolute()) {
-                db.load_directory(path);
-                loaded_data_dirs = true;
+                loaded_data_dirs |= db.load_directory(path).is_ok();
             }
         }
 
@@ -592,21 +585,23 @@ impl SharedMimeInfo {
 
         if dropped_db {
             for dir in &mut self.mime_dirs {
-                let aliases = alias::read_aliases_from_dir(&dir.path);
                 self.aliases.clear();
-                self.aliases.add_aliases(aliases);
+                self.aliases.add_aliases_from_dir(&dir.path);
 
-                let subclasses = parent::read_subclasses_from_dir(&dir.path);
                 self.parents.clear();
-                self.parents.add_subclasses(subclasses);
+                self.parents.add_subclasses_from_dir(&dir.path);
 
-                let globs = glob::read_globs_from_dir(&dir.path);
                 self.globs.clear();
-                self.globs.add_globs(globs);
+                self.globs.add_globs_from_dir(&dir.path);
 
-                self.icons = icon::read_icons_from_dir(&dir.path, false);
-                self.generic_icons = icon::read_icons_from_dir(&dir.path, true);
-                self.magic = magic::read_magic_from_dir(&dir.path);
+                self.icons.clear();
+                icon::add_icons_from_dir(&dir.path, false, &mut self.icons);
+                self.generic_icons.clear();
+                icon::add_icons_from_dir(&dir.path, true, &mut self.generic_icons);
+
+                if let Ok(magic) = magic::read_magic_from_dir(&dir.path) {
+                    self.magic = magic;
+                };
 
                 dir.mtime = fs::metadata(&dir.path)
                     .and_then(|metadata| metadata.modified())
@@ -688,7 +683,7 @@ impl SharedMimeInfo {
         self.parents
             .lookup(mime_type)
             .filter(|&res| !res.is_empty())
-            .cloned()
+            .map(|res| res.iter().cloned().collect())
     }
 
     /// Retrieves the list of matching MIME types for the given file name,
@@ -853,6 +848,27 @@ impl SharedMimeInfo {
             zero_size: true,
         }
     }
+}
+
+/// A helper function that reads the entirety of a file to a string,
+/// then parses each line using `f`, extending `collection` from those lines.
+///
+/// # Errors
+/// This function returns an error if and only if [`std::fs::read_to_string`] does.
+fn extend_from_path<T: Extend<A>, A>(
+    collection: &mut T,
+    path: &Path,
+    f: fn(&str) -> Option<A>,
+) -> io::Result<()> {
+    let file = fs::read_to_string(path)?;
+
+    collection.extend(
+        file.lines()
+            .filter(|&line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(f),
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
